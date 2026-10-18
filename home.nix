@@ -12,13 +12,13 @@ in
   home.stateVersion = "24.11";
   home.packages = with pkgs; [
     # cli i use constantly
-    ripgrep   # fast search
-    fd        # fast find
-    fzf       # fuzzy finder
-    jq        # json on the command line
+    ripgrep # fast search
+    fd # fast find
+    fzf # fuzzy finder
+    jq # json on the command line
     lazygit
     neovim
-    typescript-language-server  # TypeScript navigation for Neovim's built-in LSP
+    typescript-language-server # TypeScript navigation for Neovim's built-in LSP
     starship
     zsh-autosuggestions
     zsh-syntax-highlighting
@@ -35,6 +35,8 @@ in
   # Edit-in-place: the real file stays in my repo, ~/.config just points at it.
   home.file.".config/wezterm".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.config/wezterm";
+  home.file.".config/ghostty".source =
+    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.config/ghostty";
   home.file.".config/nvim".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.config/nvim";
   home.file.".config/herdr/config.toml".source =

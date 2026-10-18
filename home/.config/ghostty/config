@@ -1,0 +1,57 @@
+# Appearance
+font-family = "CaskaydiaCove Nerd Font"
+font-size = 14
+font-feature = +liga
+font-feature = +calt
+
+theme = "TokyoNight Storm"
+background-opacity = 0.95
+background-blur = 20
+
+window-padding-x = 12
+window-padding-y = 10
+
+cursor-style = bar
+cursor-style-blink = true
+
+# Rendering and terminal behavior
+window-vsync = true
+term = xterm-ghostty
+copy-on-select = true
+
+# Shell integration
+shell-integration = zsh
+shell-integration-features = cursor,sudo,title,ssh-env,ssh-terminfo,path
+
+# Window behavior
+window-decoration = true
+macos-titlebar-style = tabs
+window-inherit-working-directory = true
+desktop-notifications = true
+
+# Herdr shortcuts: Ghostty injects Herdr's Ctrl-B prefix sequences.
+# Keep Herdr's prefix at Ctrl-B; changing it requires updating these mappings.
+keybind = cmd+1=goto_tab:1
+keybind = cmd+2=goto_tab:2
+keybind = cmd+3=goto_tab:3
+keybind = cmd+4=goto_tab:4
+keybind = cmd+5=goto_tab:5
+
+keybind = cmd+t=text:\x02c
+keybind = cmd+n=text:\x02N
+keybind = cmd+w=text:\x02x
+keybind = cmd+shift+w=text:\x02X
+
+keybind = cmd+d=text:\x02v
+keybind = cmd+shift+d=text:\x02-
+
+keybind = cmd+alt+h=text:\x02h
+keybind = cmd+alt+j=text:\x02j
+keybind = cmd+alt+k=text:\x02k
+keybind = cmd+alt+l=text:\x02l
+
+keybind = cmd+shift+enter=text:\x02z
+keybind = cmd+shift+q=close_window
+
+# Hyper hyper-search replacement: Ghostty has built-in search UI.
+keybind = cmd+shift+f=start_search

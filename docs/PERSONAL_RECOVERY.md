@@ -36,6 +36,8 @@ eval "$(/opt/homebrew/bin/brew shellenv)"
 brew bundle --file=~/.dotfiles/Brewfile
 ```
 
+Brewfile 含 Ghostty 与 `font-caskaydia-cove-nerd-font`（Ghostty 默认字体）。
+
 ## 3. Shell 增量片段
 
 `home/.zshrc.additions` / `home/.zshenv.additions` 由仓库维护。Home Manager activation 会确保你的 `~/.zshrc` / `~/.zshenv` 里有 sourcemarker；若没有，手动加：
@@ -59,17 +61,19 @@ source "$HOME/.dotfiles/home/.zshrc.additions"
 ```sh
 git config --global user.name "chipssss"
 git config --global user.email "694590896@qq.com"
-# 或一次性 include 模板：
+# 或一次性 include 模板（含 core.excludesfile → home/git/gitignore_global）：
 # git config --global include.path ~/.dotfiles/home/git/gitconfig.personal.template
 gh auth login
 ```
+
+全局忽略规则在 `home/git/gitignore_global`；模板已设 `core.excludesfile = ~/.dotfiles/home/git/gitignore_global`。
 
 ## 5. 密钥与私密项（只挂载，不入库）
 
 **优先：Apple 钥匙串 / iCloud Keychain**（Lin 已确认）。在新机登录同一 Apple ID 后，SSH 相关项可经钥匙串恢复；再用：
 
 ```sh
-ssh-add --apple-use-keychain ~/.ssh/id_ed25519
+ssh-add --apple-use-datachain ~/.ssh/id_ed25519
 ```
 
 | 项 | 建议 |
@@ -111,19 +115,23 @@ cd ~/ai/firstmate
 Lighthouse / LightHouser 工程：从组织仓库按需 clone（如 `lighthouser-agent/...`），**不要**指望 Dotfiles 带代码。
 ego lite（Citro Labs）、Clash Verge：Brewfile 已含 `clash-verge-rev`；ego 从官网/既有安装恢复。
 
-## 8. 编辑器
+## 8. 编辑器 / 终端
 
 | 已由 Dotfiles 覆盖 | 需另恢复 |
 | --- | --- |
 | Neovim（`home/.config/nvim`） | Cursor / VS Code：见 `home/editor/README.md` |
-| WezTerm / Ghostty（brew） | 公司策略插件：**不要**进本公开仓库 |
+| WezTerm / Ghostty（`home/.config/ghostty`，HM 链接） | 公司策略插件：**不要**进本公开仓库 |
+| Ghostty 字体：`font-caskaydia-cove-nerd-font`（Brewfile） | |
+
+若尚未跑 home-manager，可手动：`ln -sfn ~/.dotfiles/home/.config/ghostty ~/.config/ghostty`。
 
 ## 9. 验收清单
 
 - [ ] `nix` / `darwin-rebuild` 可用，`./rebuild.sh` 成功
 - [ ] `brew bundle` 后 `node` `gh` `tmux` `pnpm` `uv` `go` 在 PATH
 - [ ] starship + zsh additions 生效
-- [ ] `git` 显示 `chipssss` / `694590896@qq.com`；`gh auth status` 通过
+- [ ] Ghostty 能打开且字体为 CaskaydiaCove Nerd Font
+- [ ] `git` 显示 `chipssss` / `694590896@qq.com`；`gh auth status` 通过；全局 ignore 生效
 - [ ] SSH 能 `git@github.com`（钥匙串已加载）
 - [ ] `codex` / `pi` / `claude` 已各自登录
 - [ ] Firstmate 在 `~/ai/firstmate`，INSTALL.md 预检全绿，能完成一次 scout dispatch
@@ -136,7 +144,6 @@ ego lite（Citro Labs）、Clash Verge：Brewfile 已含 `clash-verge-rev`；ego
 - 字节内网工具、工作项目专属 env
 - 任何明文 API key / token
 
-
 ## 11. MacBook 个人侧已同步进仓库
 
 从即将抹盘的 MacBook（用户 `bytedance`）只读同步了**个人通用**部分：
@@ -147,8 +154,9 @@ ego lite（Citro Labs）、Clash Verge：Brewfile 已含 `clash-verge-rev`；ego
 | Starship（可选 powerline） | `home/.config/starship.powerline.toml`（默认仍用 `starship.toml`） |
 | Cursor settings / keybindings / 扩展列表 | `home/editor/cursor/` |
 | VS Code settings / 扩展列表 | `home/editor/vscode/` |
-| Git 个人模板 | `home/git/gitconfig.personal.template`（已含确认的 name/email） |
-| Brewfile 合并 cask | 根目录 `Brewfile`（含 cursor、obsidian、rectangle、clash-verge-rev） |
+| Git 个人模板 + 全局 ignore | `home/git/gitconfig.personal.template`、`home/git/gitignore_global` |
+| Ghostty 配置 | `home/.config/ghostty/config`（HM 链接） |
+| Brewfile 合并 cask | 根目录 `Brewfile`（含 cursor、obsidian、rectangle、clash-verge-rev、ghostty、font-caskaydia-cove-nerd-font） |
 | 工具链版本表 | `docs/TOOLCHAIN.md` |
 
 **未同步（有意排除）：** 公司 email、bytesec hook、`byted-*` 扩展、代理口令、任何 `.env` / token、Lighthouse 业务代码与 `config.yaml`。

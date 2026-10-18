@@ -38,6 +38,7 @@ brew "neovim"
 cask "1password-cli"
 cask "claude-code"
 cask "ghostty"
+cask "font-caskaydia-cove-nerd-font"
 cask "wezterm"
 cask "docker"
 cask "cursor"
@@ -50,6 +51,6 @@ cask "clash-verge-rev"
 # cask "font-jetbrains-mono-nerd-font"
 
 # After brew bundle, also install language extras not in brew:
-#   curl -fsSL https://bun.sh/install | bash
-#   npm i -g @openai/codex @earendil-works/pi-coding-agent \
-#     gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi
+# curl -fsSL https://bun.sh/install | bash
+# npm i -g @openai/codex @earendil-works/pi-coding-agent \
+#   gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi

@@ -1,6 +1,6 @@
 # Personal git identity for wipe recovery (Lin / chipssss).
 # Apply after wipe (either copy sections into ~/.gitconfig, or):
-#   git config --global include.path ~/.dotfiles/home/git/gitconfig.personal.template
+# git config --global include.path ~/.dotfiles/home/git/gitconfig.personal.template
 # Do NOT put company email here.
 
 [user]
@@ -9,6 +9,7 @@
 
 [core]
 	autocrlf = input
+	excludesfile = ~/.dotfiles/home/git/gitignore_global
 
 [init]
 	defaultBranch = main
@@ -29,6 +30,6 @@
 
 # Optional: if Clash is running locally (adjust port to your setup)
 # [http]
-# 	proxy = http://127.0.0.1:7897
+#	proxy = http://127.0.0.1:7897
 # [https]
-# 	proxy = http://127.0.0.1:7897
+#	proxy = http://127.0.0.1:7897
