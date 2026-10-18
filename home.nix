@@ -1,7 +1,9 @@
-{ config, pkgs, user, ... }:
+{ config, pkgs, lib, user, ... }:
 
 let
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
+  zshMarkerBegin = "# >>> dotfiles incremental additions >>>";
+  zshMarkerEnd = "# <<< dotfiles incremental additions <<<";
 in
 
 {
@@ -16,52 +18,29 @@ in
     jq        # json on the command line
     lazygit
     neovim
+    typescript-language-server  # TypeScript navigation for Neovim's built-in LSP
+    starship
+    zsh-autosuggestions
+    zsh-syntax-highlighting
     # the font everything renders in
     nerd-fonts.hack
   ];
   fonts.fontconfig.enable = true;
   home.sessionVariables.EDITOR = "nvim";
 
-  programs.zsh = {
-    enable = true;
-    autosuggestion.enable = true;      # ghost text from history
-    syntaxHighlighting.enable = true;  # commands turn green when valid
-    initContent = ''
-      bindkey '^f' autosuggest-accept
-    '';
-    shellAliases = {
-      ".." = "cd ..";
-      add = "git add .";
-      push = "git push";
-      pull = "git pull";
-      m = "git switch main";
-      cc = "claude --dangerously-skip-permissions";
-      co = "codex --full-auto";
-    };
-  };
-
-  programs.starship = {
-    enable = true;
-    settings = {
-      add_newline = false;
-      format = "$directory$git_branch$git_status$cmd_duration$line_break$character";
-      character = {
-        success_symbol = "[❯](purple)";
-        error_symbol = "[❯](red)";
-      };
-      cmd_duration.format = "[$duration]($style) ";
-    };
-  };
+  # Existing ~/.zshrc and ~/.zshenv stay user-owned. Repository additions live
+  # in home/.zshrc.additions and home/.zshenv.additions; activation below
+  # ensures those files are sourced (idempotent markers).
 
   # Edit-in-place: the real file stays in my repo, ~/.config just points at it.
   home.file.".config/wezterm".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.config/wezterm";
   home.file.".config/nvim".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.config/nvim";
-  home.file.".config/herdr".source =
-    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.config/herdr";
-  home.file.".claude/settings.json".source =
-    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.claude/settings.json";
+  home.file.".config/herdr/config.toml".source =
+    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.config/herdr/config.toml";
+  home.file.".config/starship.toml".source =
+    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.config/starship.toml";
 
   # Keep Pi's credential and runtime state local by linking only authored files and directories.
   home.file.".pi/agent/themes".source =
@@ -79,4 +58,23 @@ in
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/AGENTS.md";
   home.file.".config/opencode/AGENTS.md".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/AGENTS.md";
+
+  home.activation.ensureDotfilesZshSnippets = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+    ensure_source() {
+      local target="$1"
+      local addition="$2"
+      mkdir -p "$(dirname "$target")"
+      touch "$target"
+      if ! grep -Fqx "${zshMarkerBegin}" "$target"; then
+        {
+          echo ""
+          echo "${zshMarkerBegin}"
+          echo "source \"$addition\""
+          echo "${zshMarkerEnd}"
+        } >> "$target"
+      fi
+    }
+    ensure_source "$HOME/.zshenv" "${dotfiles}/home/.zshenv.additions"
+    ensure_source "$HOME/.zshrc" "${dotfiles}/home/.zshrc.additions"
+  '';
 }

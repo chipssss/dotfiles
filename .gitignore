@@ -17,3 +17,16 @@ result-*
 
 # no-mistakes local validation state - never commit in this public repo
 .no-mistakes/
+
+# --- personal / secrets (never commit) ---
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env*.example
+**/*secrets*.env
+**/auth.json
+**/*.pem
+**/*.key
+!**/dummy.key
+home/.ssh/
+.fm-adp-secrets.env

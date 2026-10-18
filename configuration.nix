@@ -25,12 +25,19 @@
     finder.CreateDesktop = false;          # clean desktop
     trackpad.Clicking = true;              # tap to click
   };
+
+  # Homebrew via nix-darwin is intentionally OFF on this machine.
+  # Reason: onActivation.cleanup = "zap" would uninstall any brew package not
+  # listed below; Lin already has ~190 formulas managed outside this list.
+  # Personal CLI/cask recovery uses Brewfile at the repo root:
+  #   brew bundle --file=~/.dotfiles/Brewfile
+  # Re-enable only after the brews/casks arrays mirror what you want to keep.
   nix-homebrew = {
-    enable = true;
+    enable = false;
     inherit user;
   };
   homebrew = {
-    enable = true;
+    enable = false;
     onActivation.cleanup = "zap";  # remove anything not listed here
     onActivation.autoUpdate = true;
     onActivation.extraFlags = [ "--force" ];

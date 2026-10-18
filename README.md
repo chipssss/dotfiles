@@ -40,6 +40,9 @@ Running the switch builds:
 
 ## Fresh-machine setup
 
+> **Personal wipe recovery (Lin):** see [`docs/PERSONAL_RECOVERY.md`](docs/PERSONAL_RECOVERY.md) and the root [`Brewfile`](Brewfile). nix-homebrew is currently disabled on this checkout so `zap` cleanup cannot remove undeclared packages; use `brew bundle` for CLI/casks.
+
+
 On a brand new Mac, from a bare clone of this repo:
 
 ```sh

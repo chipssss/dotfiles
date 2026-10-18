@@ -1,0 +1,3 @@
+# Incremental additions for an existing ~/.zshenv.
+# Preserve an existing EDITOR value if the user already set one.
+export EDITOR="${EDITOR:-nvim}"

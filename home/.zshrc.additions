@@ -1,0 +1,43 @@
+# Incremental additions for an existing ~/.zshrc.
+# Keep the user's existing shell configuration intact.
+
+_dotfiles_nix_profile="/etc/profiles/per-user/${USER:-chips}"
+
+typeset -U fpath
+if [[ -d "$_dotfiles_nix_profile/share/zsh/site-functions" ]]; then
+  fpath+=("$_dotfiles_nix_profile/share/zsh/site-functions")
+fi
+autoload -U compinit && compinit
+
+if [[ -r "$_dotfiles_nix_profile/share/zsh-autosuggestions/zsh-autosuggestions.zsh" ]]; then
+  source "$_dotfiles_nix_profile/share/zsh-autosuggestions/zsh-autosuggestions.zsh"
+  ZSH_AUTOSUGGEST_STRATEGY=(history)
+fi
+
+if [[ -r "$_dotfiles_nix_profile/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh" ]]; then
+  source "$_dotfiles_nix_profile/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
+  ZSH_HIGHLIGHT_HIGHLIGHTERS=(main)
+fi
+
+if [[ "${TERM:-}" != "dumb" ]] && command -v starship >/dev/null 2>&1; then
+  eval "$(starship init zsh)"
+fi
+
+if (( $+widgets[autosuggest-accept] )); then
+  bindkey '^f' autosuggest-accept
+fi
+
+HISTSIZE="${HISTSIZE:-10000}"
+SAVEHIST="${SAVEHIST:-10000}"
+HISTFILE="${HISTFILE:-$HOME/.zsh_history}"
+setopt HIST_FCNTL_LOCK HIST_IGNORE_DUPS HIST_IGNORE_SPACE SHARE_HISTORY
+
+alias .. >/dev/null 2>&1 || alias -- ..='cd ..'
+alias add >/dev/null 2>&1 || alias -- add='git add .'
+alias push >/dev/null 2>&1 || alias -- push='git push'
+alias pull >/dev/null 2>&1 || alias -- pull='git pull'
+alias m >/dev/null 2>&1 || alias -- m='git switch main'
+alias cc >/dev/null 2>&1 || alias -- cc='claude --dangerously-skip-permissions'
+alias co >/dev/null 2>&1 || alias -- co='codex --full-auto'
+
+unset _dotfiles_nix_profile
