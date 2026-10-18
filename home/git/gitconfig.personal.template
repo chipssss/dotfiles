@@ -1,6 +1,11 @@
-# Copy snippets into ~/.gitconfig after wipe. Do NOT put company email here.
-#   git config --global user.name "YOUR_NAME"
-#   git config --global user.email "YOUR_PERSONAL_EMAIL"
+# Personal git identity for wipe recovery (Lin / chipssss).
+# Apply after wipe (either copy sections into ~/.gitconfig, or):
+#   git config --global include.path ~/.dotfiles/home/git/gitconfig.personal.template
+# Do NOT put company email here.
+
+[user]
+	name = chipssss
+	email = 694590896@qq.com
 
 [core]
 	autocrlf = input
