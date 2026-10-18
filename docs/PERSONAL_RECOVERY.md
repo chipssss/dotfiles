@@ -73,7 +73,7 @@ gh auth login
 **优先：Apple 钥匙串 / iCloud Keychain**（Lin 已确认）。在新机登录同一 Apple ID 后，SSH 相关项可经钥匙串恢复；再用：
 
 ```sh
-ssh-add --apple-use-datachain ~/.ssh/id_ed25519
+ssh-add --apple-use-keychain ~/.ssh/id_ed25519
 ```
 
 | 项 | 建议 |
