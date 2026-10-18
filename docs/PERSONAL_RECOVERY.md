@@ -127,3 +127,28 @@ ego lite（Citro Labs）、Clash Verge：从官网/现有安装包恢复；本 B
 - 公司邮箱硬编码、公司 git hook（如 bytesec）、公司 VPN/证书
 - 字节内网工具、工作项目专属 env
 - 任何明文 API key / token
+
+
+## 11. MacBook 个人侧已同步进仓库
+
+从即将抹盘的 MacBook（用户 `bytedance`）只读同步了**个人通用**部分：
+
+| 内容 | 仓库位置 |
+| --- | --- |
+| Shell aliases / fzf | `home/.zshrc.additions` |
+| Starship（可选 powerline） | `home/.config/starship.powerline.toml`（默认仍用 `starship.toml`） |
+| Cursor settings / keybindings / 扩展列表 | `home/editor/cursor/` |
+| VS Code settings / 扩展列表 | `home/editor/vscode/` |
+| Git 个人模板（无 email） | `home/git/gitconfig.personal.template` |
+| Brewfile 合并 cask | 根目录 `Brewfile`（含 cursor、obsidian、rectangle、clash-verge-rev） |
+| 工具链版本表 | `docs/TOOLCHAIN.md` |
+
+**未同步（有意排除）：** 公司 email、bytesec hook、`byted-*` 扩展、代理口令、任何 `.env` / token、Lighthouse 业务代码与 `config.yaml`。
+
+### Lighthouse / Firstmate 路径习惯
+
+- Firstmate：优先 `~/ai/firstmate`（Mini 现状）；团队 INSTALL 默认 `~/firstmate`——二选一，保持一致即可。
+- Lighthouse（MacBook 有 `~/ai/lighthouse`）：抹盘后**重新 clone** 对应仓库，用 `config.example.yaml` 重建本地配置；不要从旧机拷 `config.yaml` / `.env`。
+- LightHouser 工程：经 Firstmate / `lighthouser-agent` org 按需 clone。
+
+恢复编辑器：见 `home/editor/README.md`。

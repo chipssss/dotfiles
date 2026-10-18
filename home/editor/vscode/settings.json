@@ -1,0 +1,10 @@
+{
+  "git.enableSmartCommit": true,
+  "git.confirmSync": false,
+  "explorer.confirmDelete": false,
+  "editor.fontSize": 16,
+  "files.autoSave": "afterDelay",
+  "claudeCode.useTerminal": true,
+  "editor.accessibilitySupport": "on",
+  "workbench.editorLargeFileConfirmation": 16
+}

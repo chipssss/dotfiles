@@ -1,0 +1,29 @@
+# Copy snippets into ~/.gitconfig after wipe. Do NOT put company email here.
+#   git config --global user.name "YOUR_NAME"
+#   git config --global user.email "YOUR_PERSONAL_EMAIL"
+
+[core]
+	autocrlf = input
+
+[init]
+	defaultBranch = main
+
+[pull]
+	rebase = true
+
+[push]
+	autoSetupRemote = true
+
+[credential "https://github.com"]
+	helper =
+	helper = !/opt/homebrew/bin/gh auth git-credential
+
+[credential "https://gist.github.com"]
+	helper =
+	helper = !/opt/homebrew/bin/gh auth git-credential
+
+# Optional: if Clash is running locally (adjust port to your setup)
+# [http]
+# 	proxy = http://127.0.0.1:7897
+# [https]
+# 	proxy = http://127.0.0.1:7897

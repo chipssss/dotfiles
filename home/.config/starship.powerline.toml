@@ -1,0 +1,53 @@
+# Optional powerline-style prompt synced from MacBook personal config.
+# Activate: export STARSHIP_CONFIG="$HOME/.dotfiles/home/.config/starship.powerline.toml"
+# Default remains starship.toml (minimal rose-pine-friendly).
+format = """
+[](#b45aa8)$username[](fg:#b45aa8 bg:#8c7a96)$directory[](fg:#8c7a96 bg:#e0a18f)$git_branch$git_status[](fg:#e0a18f)$fill$time
+$character"""
+
+command_timeout = 500
+
+[fill]
+symbol = " "
+
+[username]
+show_always = true
+style_user = "bg:#b45aa8 fg:#fff8ff bold"
+style_root = "bg:#b45aa8 fg:#fff8ff bold"
+format = "[ $user ]($style)"
+
+[directory]
+style = "bg:#8c7a96 fg:#f9f2fa bold"
+format = "[ $path ]($style)"
+truncation_length = 3
+truncate_to_repo = true
+truncation_symbol = "…/"
+
+[git_branch]
+symbol = " "
+style = "bg:#e0a18f fg:#442634 bold"
+format = "[ $symbol$branch ]($style)"
+
+[git_status]
+conflicted = "="
+ahead = "↑${count}"
+behind = "↓${count}"
+diverged = "↑${ahead_count}↓${behind_count}"
+untracked = "?"
+modified = "!"
+staged = "+"
+stashed = "S"
+deleted = "x"
+renamed = "r"
+style = "bg:#e0a18f fg:#442634 bold"
+format = "[$all_status$ahead_behind ]($style)"
+
+[time]
+disabled = false
+time_format = "%H:%M"
+style = "bg:#736283 fg:#f7eff8 bold"
+format = "[](fg:#736283)[  $time ]($style)[](fg:#736283)"
+
+[character]
+success_symbol = "[❯](bold #b45aa8)"
+error_symbol = "[❯](bold #ef7f96)"

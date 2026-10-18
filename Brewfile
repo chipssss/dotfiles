@@ -1,7 +1,7 @@
 # Personal Homebrew bundle for wipe recovery.
 # Use this instead of nix-darwin homebrew when cleanup=zap would be too aggressive.
 # Install: brew bundle --file=~/.dotfiles/Brewfile
-# Review before first run; remove anything you do not want.
+# Synced from Mini inventory + MacBook personal apps (company tooling excluded).
 
 # --- CLI (personal daily) ---
 brew "gh"
@@ -32,18 +32,24 @@ brew "yt-dlp"
 brew "deno"
 brew "herdr"
 brew "cloudflared"
+brew "neovim"
 
-# --- Casks (personal apps; install Cursor/Clash/1Password from their sites if cask missing) ---
+# --- Casks (personal apps) ---
 cask "1password-cli"
 cask "claude-code"
 cask "ghostty"
 cask "wezterm"
 cask "docker"
-# Optional / confirm with Lin before enabling:
-# cask "cursor"          # if available as cask; else download from cursor.com
-# cask "obsidian"
-# cask "rectangle"
-# cask "clash-verge-rev" # proxy; confirm formula/cask name
+cask "cursor"
+cask "obsidian"
+cask "rectangle"
+cask "clash-verge-rev"
+# Optional convenience (MacBook had these; enable if wanted):
+# cask "alfred"
+# cask "maccy"
+# cask "font-jetbrains-mono-nerd-font"
 
-# --- Optional taps / formulas Lin often needs for fm ---
-# After brew bundle: npm i -g @openai/codex @earendil-works/pi-coding-agent gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi
+# After brew bundle, also install language extras not in brew:
+#   curl -fsSL https://bun.sh/install | bash
+#   npm i -g @openai/codex @earendil-works/pi-coding-agent \
+#     gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi

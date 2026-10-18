@@ -1,0 +1,8 @@
+# Personal Cursor extensions (company/internal extensions excluded).
+# Install: while read -r e; do [[ "$e" =~ ^#|^$ ]] || cursor --install-extension "$e"; done < ~/.dotfiles/home/editor/cursor/extensions.txt
+mechatroner.rainbow-csv
+ms-azuretools.vscode-docker
+ms-python.debugpy
+ms-python.python
+ms-python.vscode-pylance
+shd101wyy.markdown-preview-enhanced

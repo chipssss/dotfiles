@@ -1,0 +1,6 @@
+# Incremental additions for ~/.zprofile (Homebrew PATH on Apple Silicon).
+# HM activation does not manage this file yet; after wipe, ensure:
+#   eval "$(/opt/homebrew/bin/brew shellenv)"
+if [[ -x /opt/homebrew/bin/brew ]] && [[ ":$PATH:" != *":/opt/homebrew/bin:"* ]]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+fi

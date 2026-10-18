@@ -1,0 +1,12 @@
+{
+  "window.commandCenter": 1,
+  "diffEditor.ignoreTrimWhitespace": false,
+  "editor.fontSize": 16,
+  "editor.dropIntoEditor.preferences": [],
+  "markdown-preview-enhanced.alwaysShowBacklinksInPreview": true,
+  "markdown-preview-enhanced.automaticallyShowPreviewOfMarkdownBeingEdited": true,
+  "markdown-preview-enhanced.codeBlockTheme": "atom-dark.css",
+  "markdown-preview-enhanced.enableHTML5Embed": true,
+  "markdown-preview-enhanced.enableExtendedTableSyntax": true,
+  "markdown-preview-enhanced.enableTypographer": true
+}
