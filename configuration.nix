@@ -19,11 +19,17 @@
       InitialKeyRepeat = 15;  # short delay before repeat
       _HIHideMenuBar = true;  # auto-hide the menu bar
       AppleShowAllExtensions = true;
+      "com.apple.keyboard.fnState" = true;  # F1-F12 act as standard function keys
     };
     dock.autohide = true;
+    dock.tilesize = 64;                    # larger Dock icons (default 48)
+    dock.wvous-br-corner = 5;              # bottom-right hot corner: start screen saver
     finder.FXPreferredViewStyle = "Nlsv";  # list view by default
     finder.CreateDesktop = false;          # clean desktop
+    finder.AppleShowAllFiles = true;       # show hidden files in Finder
+    finder.FXRemoveOldTrashItems = true;   # empty Trash items after 30 days
     trackpad.Clicking = true;              # tap to click
+    trackpad.TrackpadThreeFingerDrag = true;  # three-finger drag
   };
 
   # Homebrew via nix-darwin is intentionally OFF on this machine.
