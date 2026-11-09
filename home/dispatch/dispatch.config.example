@@ -21,6 +21,8 @@ ports = 3110-3999
 # Other loopback passwords are flagged, including numeric-port SSH tunnels,
 # unless the port itself is a complete ${{ ... }} CI template expression.
 # Multiple @ delimiters or comma-separated hosts never receive an exemption.
+# A host= or hostaddr= query parameter (case-insensitive) disables both loopback
+# exemptions; harmless query parameters do not change them.
 # An empty list disables only the password-based exemption. Changes also affect
 # doctor's effective-config fingerprint.
 secret_fixture_passwords = postgres synthetic

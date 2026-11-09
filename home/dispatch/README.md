@@ -141,6 +141,10 @@ disables the password-based exemption, not the CI-port exemption. Numeric-port
 loopback URLs with other passwords are flagged, including SSH tunnel URLs.
 Lookalikes such as `127.0.0.1.evil.com` and `localhost.example`, multiple `@`
 delimiters, and comma-separated libpq hosts never receive a host exemption.
+A `host=` or `hostaddr=` query parameter (case-insensitive, after `?` or `&`)
+disables both loopback exemptions, even for an empty or loopback value. Other
+parameters such as `sslmode` and `application_name` do not affect exemptions;
+queries on later URLs on the same line are checked independently.
 Whitelist changes affect both scanner behavior and doctor's effective-config
 fingerprint. URLs without a password are not flagged by this rule.
 It prints locations/categories, never matched values. These patterns and custom

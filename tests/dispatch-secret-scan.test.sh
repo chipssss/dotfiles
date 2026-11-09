@@ -24,18 +24,22 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
     print('PASS: redacted CI loopback URL is clean', flush=True)
 
     passed = 1
-    def check_url(host, port, expected, user='postgres', scheme='postgresql', password='<pw>'):
+    def check_url(host, port, expected, user='postgres', scheme='postgresql', password='<pw>', query=''):
         global passed
-        url = f'{scheme}://{user}:{password}@{host}{port}/app_test'
+        url = f'{scheme}://{user}:{password}@{host}{port}/app_test{query}'
         artifact.write_text('TEST_DATABASE_URL: ' + url + '\n')
         scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
-        assert scan.returncode == expected, f'{host}, {port!r}: expected {expected}, got {scan.returncode}'
+        assert scan.returncode == expected, f'{host}, {port!r}, {query!r}: expected {expected}, got {scan.returncode}'
         assert not scan.stderr and url not in scan.stdout and '<pw>' not in scan.stdout, 'scanner must not echo credentials'
         if expected == 0:
             assert not scan.stdout, 'loopback URL must produce no findings'
         else:
             assert scan.stdout == f'{artifact}:1: 带密码的 URL\n', 'non-loopback URL must produce a password-URL finding'
         passed += 1
+
+    # libpq query parameters can override an otherwise loopback CI target.
+    check_url('localhost', ':${{ job.services.postgres.ports[5432] }}', 1,
+              user='app_test', query='?host=db.prod.example.com')
 
     # A later @ or libpq host separator must never inherit a loopback exemption.
     for host, port in [
@@ -69,6 +73,42 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
             for user in ['postgres', '']:
                 check_url(host, port, 0 if port == ports[2] else 1, user=user)
                 check_url(host, port, 0, user=user, password='synthetic')
+
+    # Both loopback exemptions reject target overrides, even empty/local values.
+    # Names are case-insensitive and can follow either ? or & in the query.
+    target_queries = [
+        '?host=db.prod.example.com',
+        '?hostaddr=203.0.113.7',
+        '?sslmode=disable&host=db.prod.example.com',
+        '?sslmode=disable&hostaddr=203.0.113.7',
+        '?HOST=db.prod.example.com',
+        '?application_name=probe&HoStAdDr=203.0.113.7',
+        '?host=', '?hostaddr=', '?host=localhost',
+    ]
+    harmless_queries = [
+        '?sslmode=disable', '?application_name=hostx',
+        '?application_name=host=db.prod.example.com',
+        '?myhost=db.prod.example.com', '?hostaddress=203.0.113.7',
+        '/host=db.prod.example.com', '/&host=db.prod.example.com',
+        '#?host=db.prod.example.com', '?sslmode=disable#&host=db.prod.example.com',
+    ]
+    for host in loopbacks:
+        for port, password in [('', 'synthetic'), (':5432', 'postgres'),
+                               (ports[2], '<pw>'), (ports[2], 'synthetic')]:
+            for query in target_queries:
+                check_url(host, port, 1, password=password, query=query)
+            for query in harmless_queries:
+                check_url(host, port, 0, password=password, query=query)
+
+    # A following URL's query cannot revoke the first URL's exemption.
+    later_target = 'postgresql://' + 'db.example.com/app_test?host=db.prod.example.com'
+    for port, password in [(':5432', 'synthetic'), (ports[2], '<pw>')]:
+        first_url = 'postgresql://' + f'app_test:{password}@localhost{port}/app_test?sslmode=disable'
+        for separator in [' ', '\t', '"', "'"]:
+            artifact.write_text(first_url + separator + later_target + '\n')
+            scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
+            assert scan.returncode == 0 and not scan.stdout and not scan.stderr, 'queries belong only to their own URL'
+            passed += 1
 
     # Expressions outside the port, incomplete expressions and trailing port text
     # are not service-container ports. Numeric tunnel passwords must still report.

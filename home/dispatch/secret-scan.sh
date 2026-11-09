@@ -42,18 +42,27 @@ URL_SUFFIX = re.compile(rb'(?:\$\{\{[^\r\n]*?\}\}|[^\s/\?#\'\"])*')
 
 CI_PORT = re.compile(rb':\$\{\{(?P<expression>(?:(?!\}\})[^\r\n])*)\}\}(?=[/?#]|$)')
 
+# Start after the authority so spaces/quotes inside a CI port stay opaque.
+# Stop at this URL's boundary; fragments cannot override libpq connection targets.
+URL_TAIL = re.compile(rb'[^\s\'"#]*')
+QUERY_TARGET = re.compile(rb'(?:^|[?&])host(?:addr)?=', re.IGNORECASE)
+
 # Loopbacks are fixtures only with an allowlisted password or a CI template port.
 def fixture(match):
     host = match.groupdict().get('host')
     if host is None:
         return False
-    suffix = URL_SUFFIX.match(match.string, match.end()).group()
+    authority_end = URL_SUFFIX.match(match.string, match.end())
+    suffix = authority_end.group()
     if b'@' in match.group('userinfo') or b'@' in suffix or b',' in suffix or b',' in host:
         return False
     host = host.lower()
     if host.endswith(b'.invalid'):
         return True
     if host not in (b'localhost', b'127.0.0.1', b'::1', b'[::1]'):
+        return False
+    query = URL_TAIL.match(match.string, authority_end.end()).group().partition(b'?')[2]
+    if QUERY_TARGET.search(query):
         return False
     port = CI_PORT.match(suffix)
     return match.group('pw') in fixture_passwords or bool(port and port.group('expression').strip())
