@@ -1,0 +1,894 @@
+#!/usr/bin/env python3
+"""dispatch: the one local entry for pi workers, from worktree to merge.
+
+  dispatch start NAME BRIEF.md [--base main] [--branch B] [--common FILE] [--card ID | --new-card TITLE] [--dry-run]
+  dispatch status [--json]          every worker: phase, why it is stuck, PR, review verdict
+  dispatch wait [CURSOR]            block until new events (DONE / NEEDS HUMAN / STUCK / REVIEWED ...)
+  dispatch review NAME | --pr N --author pi|claude --brief FILE   cross-family review of the PR head
+  dispatch merge PR [--dry-run]     merge, only with an APPROVE verdict for the current head
+  dispatch adopt NAME --out FILE    supervise a pi pane started without dispatch
+  dispatch clean NAME [--force]     close pane, remove worktree, local and remote branch, free ports
+  dispatch doctor                   installed vs repo version, local drift, project config, dependencies
+
+Project values (repo, state and evidence dirs, card command, merge script, approval rules) come from
+$DISPATCH_CONFIG or ~/.config/dispatch/config; see dispatch.config.example next to this file.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS))
+import dispatchconf  # noqa: E402
+
+EVENTS = Path(os.environ.get('PI_SUPERVISOR_STATE_DIR', '/private/tmp/pi-supervisor')) / 'events.log'
+PI_WORKER = SCRIPTS / 'pi-worker'
+MODELS = Path.home() / '.claude/rules/pstack-models.md'
+REVIEW_ROLE = 'interrogate reviewers'
+PI_TRUST = Path.home() / '.pi/agent/trust.json'
+VERDICTS = ('APPROVE', 'REQUEST_CHANGES')
+REQUIRED = ('repo', 'state_dir', 'evidence_dir')
+CONF = REPO = ROOT = EVIDENCE = WT_ROOT = PORTS = None
+
+
+def configure():
+    """Read the project config once per command; every path below comes from it."""
+    global CONF, REPO, ROOT, EVIDENCE, WT_ROOT, PORTS
+    try:
+        CONF = dispatchconf.load()
+    except (OSError, ValueError) as e:
+        raise Refused(f'配置无法读取：{e}')
+    missing = [k for k in REQUIRED if not CONF.get(k)]
+    if missing:
+        raise Refused(f'{dispatchconf.path()} 缺少 {", ".join(missing)}；先跑 dispatch doctor')
+    REPO, ROOT, EVIDENCE = (dispatchconf.file(CONF, k) for k in REQUIRED)
+    WT_ROOT = dispatchconf.file(CONF, 'worktree_root') or Path('/private/tmp/dispatch-wt')
+    first, _, last = CONF.get('ports', '3110-3999').partition('-')
+    PORTS = range(int(first), int(last or first) + 1 - 9, 10)
+    # pi-worker and its approval rules read the same file.
+    os.environ['DISPATCH_CONFIG'] = str(dispatchconf.path())
+
+
+class Refused(Exception):
+    pass
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def run(cmd, cwd=None, check=True, env=None, stdin=None):
+    p = subprocess.run(cmd, cwd=cwd, env=env, input=stdin, capture_output=True, text=True)
+    if check and p.returncode:
+        # stderr of git/gh/the card command never carries our secrets; keep it short.
+        raise Refused(f'{" ".join(map(str, cmd[:3]))} 失败 (exit {p.returncode}): {p.stderr.strip()[:300]}')
+    return p
+
+
+def gh(*args, check=True):
+    return run(['gh', *args], cwd=REPO, check=check)
+
+
+def notify(text):
+    EVENTS.parent.mkdir(parents=True, exist_ok=True)
+    with EVENTS.open('a') as f:
+        f.write(f'{now()} {text}\n')
+    print(text, flush=True)
+    subprocess.Popen(['osascript', '-e', 'on run argv', '-e',
+                      'display notification (item 1 of argv) with title "dispatch"', '-e', 'end run', text],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def worker_dir(name):
+    return ROOT / 'workers' / name
+
+
+def load(name):
+    path = worker_dir(name) / 'state.json'
+    if not path.exists():
+        raise Refused(f'没有在跑的 worker {name}')
+    return json.loads(path.read_text())
+
+
+def save(state):
+    d = worker_dir(state['name'])
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / 'state.json.tmp'
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n')
+    tmp.replace(d / 'state.json')
+
+
+def workers():
+    for path in sorted((ROOT / 'workers').glob('*/state.json')):
+        yield json.loads(path.read_text())
+
+
+def alive(pid_file):
+    try:
+        pid = int(pid_file.read_text())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+class Lock:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(200):
+            try:
+                self.path.mkdir()
+                return self
+            except FileExistsError:
+                time.sleep(0.05)
+        raise Refused(f'锁 {self.path} 被占用超过 10 秒')
+
+    def __exit__(self, *exc):
+        self.path.rmdir()
+
+
+def allocate_ports():
+    used = {s['ports']['base'] for s in workers() if s.get('ports')}
+    for base in PORTS:
+        if base in used:
+            continue
+        busy = run(['lsof', '-nP', f'-iTCP:{base}-{base + 9}', '-sTCP:LISTEN', '-t'], check=False).stdout.strip()
+        if not busy:
+            return {'base': base, 'api': base + 1, 'web': base + 2, 'last': base + 9}
+    raise Refused('没有空闲端口段')
+
+
+def trust_worktree_root():
+    """pi asks "Trust project folder?" for an untrusted cwd and the pane hangs; trust our root once."""
+    WT_ROOT.mkdir(parents=True, exist_ok=True)
+    data = json.loads(PI_TRUST.read_text()) if PI_TRUST.exists() else {}
+    if data.get(str(WT_ROOT)) is True:
+        return
+    with Lock(Path(str(PI_TRUST) + '.lock')):  # the same lock directory pi's proper-lockfile takes
+        data = json.loads(PI_TRUST.read_text()) if PI_TRUST.exists() else {}
+        data[str(WT_ROOT)] = True
+        tmp = PI_TRUST.with_suffix('.dispatch-tmp')
+        tmp.write_text(json.dumps(dict(sorted(data.items())), indent=2) + '\n')
+        tmp.replace(PI_TRUST)
+
+
+def card_command(name, title):
+    """card_command in the config, with {title} filled in; it must print JSON with identifier (and id)."""
+    template = CONF.get('card_command')
+    if not template:
+        raise Refused('配置里没有 card_command，不能 --new-card')
+    return [w.replace('{title}', f'{name} · {title}') for w in shlex.split(template)]
+
+
+def create_card(name, title):
+    env = dict(os.environ, **dict(kv.split('=', 1) for kv in dispatchconf.words(CONF, 'card_env')))
+    try:
+        card = json.loads(run(card_command(name, title), env=env).stdout)
+    except (Refused, ValueError) as e:
+        print(f'警告：建卡失败，继续启动：{e}', file=sys.stderr)
+        return None
+    log = dispatchconf.file(CONF, 'card_log')
+    if log:
+        with log.open('a') as f:
+            f.write(f'{name} {card["identifier"]} {card.get("id", "")}\n')
+    return card['identifier']
+
+
+def compose_brief(state, task_brief, common):
+    task = Path(task_brief).read_text()
+    parts = []
+    role = dispatchconf.file(CONF, 'role_brief')
+    # A task brief that already starts from the role text (same first line) does not get it twice.
+    if role and role.read_text().splitlines()[0] not in task:
+        parts.append(role.read_text())
+    if common:
+        parts.append(Path(common).read_text())
+    p = state['ports']
+    card = f'工作卡 {state["card"]}' if state.get('card') else '本任务没有工作卡，跳过卡片更新'
+    parts.append(f"""## 本次分配（dispatch 生成，与上文冲突时以此为准）
+- 任务名 {state['name']}；最终报告写 `{state['out']}`。
+- worktree 已建好：`{state['worktree']}`，分支 `{state['branch']}` 从 `origin/{state['base']}` 切出，origin 上已有同名分支并设为上游。只在这个 worktree 里改，推送直接 `git push`；不要再建 worktree，不要改上游。
+- 端口段 {p['base']}-{p['last']}：API 用 {p['api']}，前端用 {p['web']}，其余端口在段内取。
+- {card}。
+- 确认框由监管自动处理：安全操作自动放行，其余操作会通知协调者并等待，你不用退出或重试。
+- PR 就绪后不要合入，也不要请求合入：dispatch 会让另一模型族独立评审当前 head，合入门只认那个结论。
+""")
+    parts.append('## 任务\n' + task)
+    return '\n\n'.join(parts)
+
+
+def cmd_start(a):
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', a.name):
+        raise Refused('NAME 只能含字母、数字、- 和 _')
+    if not Path(a.brief).is_file():
+        raise Refused(f'没有 brief 文件 {a.brief}')
+    branch = a.branch or f'dispatch/{a.name.lower()}'
+    wt = WT_ROOT / a.name
+    if a.dry_run:
+        return dry_run_start(a, branch, wt)
+    with Lock(ROOT / '.lock'):
+        if worker_dir(a.name).exists():
+            raise Refused(f'{a.name} 已存在；先 dispatch clean {a.name}')
+        if wt.exists():
+            raise Refused(f'{wt} 已存在')
+        run(['git', '-C', REPO, 'fetch', '-q', 'origin', a.base])
+        if run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', branch], check=False).returncode == 0:
+            raise Refused(f'origin 上已有分支 {branch}')
+        trust_worktree_root()
+        # --no-track: a worktree tracking origin/<base> makes a bare push look like a push to the shared base.
+        run(['git', '-C', REPO, 'worktree', 'add', '-q', '--no-track', '-b', branch, wt, f'origin/{a.base}'])
+        sha = run(['git', '-C', wt, 'rev-parse', 'HEAD']).stdout.strip()
+        # Create the remote branch through the API (no pre-push hook on an empty branch), then track it.
+        gh('api', '-X', 'POST', 'repos/{owner}/{repo}/git/refs', '-f', f'ref=refs/heads/{branch}', '-f', f'sha={sha}')
+        run(['git', '-C', wt, 'fetch', '-q', 'origin', f'{branch}:refs/remotes/origin/{branch}'])
+        run(['git', '-C', wt, 'branch', '-q', f'--set-upstream-to=origin/{branch}'])
+        state = {
+            'name': a.name, 'branch': branch, 'base': a.base, 'base_sha': sha, 'worktree': str(wt),
+            'ports': allocate_ports(), 'card': a.card or (create_card(a.name, a.new_card) if a.new_card else None),
+            **worker_model(a), 'author_family': 'pi', 'timeout_min': a.timeout,
+            'task_brief': str(Path(a.brief).resolve()), 'out': str(EVIDENCE / a.name / 'result.md'),
+            'started_at': now(),
+        }
+        save(state)
+    brief = worker_dir(a.name) / 'brief.md'
+    brief.write_text(compose_brief(state, a.brief, a.common))
+    spawn_runner(a.name)
+    p = state['ports']
+    print(f'started {a.name}: worktree {wt} branch {branch} ports {p["base"]}-{p["last"]} card {state["card"] or "-"}')
+    print(f'brief {brief}\nout {state["out"]}\nlog {worker_dir(a.name) / "supervisor.log"}')
+
+
+def worker_model(a):
+    return {'model': a.model or CONF.get('worker_model', 'openai/gpt-6.1-sol'),
+            'thinking': a.thinking or CONF.get('worker_thinking', 'high')}
+
+
+def dry_run_start(a, branch, wt):
+    """Every check start makes, with no worktree, branch, card, pane or state written."""
+    problems = []
+    if worker_dir(a.name).exists():
+        problems.append(f'{a.name} 已存在；先 dispatch clean {a.name}')
+    if wt.exists():
+        problems.append(f'{wt} 已存在')
+    if run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', a.base], check=False).returncode:
+        problems.append(f'origin 上没有 base 分支 {a.base}')
+    if run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', branch], check=False).returncode == 0:
+        problems.append(f'origin 上已有分支 {branch}')
+    ports = allocate_ports()
+    card = a.card or (shlex.join(card_command(a.name, a.new_card)) + '（未执行）' if a.new_card else '-')
+    state = {'name': a.name, 'branch': branch, 'base': a.base, 'worktree': str(wt), 'ports': ports,
+             'card': a.card or (f'<--new-card {a.new_card}>' if a.new_card else None),
+             'out': str(EVIDENCE / a.name / 'result.md')}
+    brief = compose_brief(state, a.brief, a.common)
+    print(f'dry-run {a.name}（{dispatchconf.path()}）')
+    for k, v in [('repo', REPO), ('worktree', wt), ('branch', f'{branch}（从 origin/{a.base}）'),
+                 ('ports', f'{ports["base"]}-{ports["last"]}'), ('card', card), ('out', state['out']),
+                 ('brief', f'{len(brief.splitlines())} 行，worker 收到的完整 brief'),
+                 ('model', ' '.join(worker_model(a).values())),
+                 ('pi-worker', PI_WORKER)]:
+        print(f'  {k:9} {v}')
+    if problems:
+        raise Refused('；'.join(problems))
+    print('可以启动：去掉 --dry-run 重跑')
+
+
+def spawn_runner(name):
+    log = (worker_dir(name) / 'supervisor.log').open('a')
+    p = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '_run', name],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    (worker_dir(name) / 'runner.pid').write_text(str(p.pid))
+
+
+def context_args(directory):
+    """Load only the repo's AGENTS.md: pi's own discovery walks up into parent directories."""
+    agents = Path(directory) / 'AGENTS.md'
+    return ['--context', str(agents)] if agents.is_file() else []
+
+
+def cmd_run(a):
+    state = load(a.name)
+    d = worker_dir(a.name)
+    (d / 'runner.pid').write_text(str(os.getpid()))
+    common = ['--out', state['out'], '--timeout-min', str(state['timeout_min']), '--idle-min', '12']
+    if state.get('adopted'):
+        cmd = [str(PI_WORKER), '--attach', state['block'], '--label', state['label'], *common]
+    else:
+        wt = state['worktree']
+        cmd = [str(PI_WORKER), '--model', state['model'], '--thinking', state['thinking'], '--cwd', wt,
+               *context_args(wt), '--prompt-file', str(d / 'brief.md'),
+               '--label', f'dispatch {a.name}', *common]
+    try:
+        code = subprocess.call(['sh', *cmd])
+    except OSError as e:
+        notify(f'EXITED {a.name}: 无法启动 pi-worker（{type(e).__name__}）')
+        raise
+    scan = collect(state, code)
+    if code == 0 and scan['exit'] == 0 and state.get('branch') and (d / 'brief.md').exists():
+        pr = find_pr(state['branch'])
+        if pr and pr['state'] == 'OPEN':
+            try:
+                review(pr['number'], state['author_family'], str(d / 'brief.md'), state.get('worktree'), state['out'])
+            except Refused as e:
+                notify(f'REVIEW FAILED {a.name} PR#{pr["number"]}: {e}')
+
+
+def collect(state, code):
+    out = Path(state['out'])
+    targets = [p for p in (out.parent, worker_dir(state['name']) / 'supervisor.log') if p.exists()]
+    p = run([str(SCRIPTS / 'secret-scan.sh'), *map(str, targets)], check=False) if targets else None
+    scan = {'exit': p.returncode if p else 2, 'hits': p.stdout.splitlines() if p else ['没有可扫描的产出']}
+    (worker_dir(state['name']) / 'exit.json').write_text(
+        json.dumps({'code': code, 'at': now(), 'scan': scan}, ensure_ascii=False, indent=2) + '\n')
+    if scan['exit']:
+        notify(f'BLOCKED {state["name"]}: 产出令牌扫描未通过（{len(scan["hits"])} 处，见 exit.json），不收卷')
+    elif code == 0:
+        notify(f'COLLECTED {state["name"]}: 报告非空，令牌扫描干净')
+    return scan
+
+
+def find_pr(branch):
+    prs = json.loads(gh('pr', 'list', '--head', branch, '--state', 'all', '--limit', '5', '--json',
+                        'number,state,isDraft,headRefOid,url,baseRefName').stdout)
+    return prs[0] if prs else None
+
+
+def reviewer_for(author_family):
+    for line in MODELS.read_text().splitlines():
+        if line.startswith(REVIEW_ROLE + ':'):
+            for entry in line.split(':', 1)[1].split(','):
+                spec = entry.split()
+                if len(spec) != 2:
+                    continue
+                family = 'pi' if spec[0].startswith('pi:') else 'claude'
+                if family != author_family:
+                    return {'family': family, 'model': spec[0].removeprefix('pi:'), 'effort': spec[1]}
+    raise Refused(f'{MODELS} 的「{REVIEW_ROLE}」没有与作者（{author_family}）不同族的模型')
+
+
+def review_dir(pr, head):
+    return ROOT / 'reviews' / f'pr-{pr}' / head
+
+
+def review(number, author_family, brief, worktree=None, report=None, force=False):
+    view = lambda: json.loads(gh('pr', 'view', str(number), '--json',
+                                 'number,url,headRefOid,baseRefName,state').stdout)
+    pr = view()
+    head = pr['headRefOid']
+    d = review_dir(number, head)
+    verdict_file = d / 'verdict.json'
+    if verdict_file.exists() and not force:
+        print(verdict_file.read_text())
+        return json.loads(verdict_file.read_text())
+    (d / 'out').mkdir(parents=True, exist_ok=True)
+    if alive(d / 'reviewing.pid'):
+        raise Refused(f'PR#{number} head {head[:9]} 已有评审在跑')
+    (d / 'reviewing.pid').write_text(str(os.getpid()))
+    try:
+        diff = gh('pr', 'diff', str(number)).stdout
+        if view()['headRefOid'] != head:
+            raise Refused('取 diff 时 PR head 变了，重跑 review')
+        (d / 'diff.patch').write_text(diff)
+        reviewer = reviewer_for(author_family)
+        out = d / 'out' / 'review.md'
+        scan = run([str(SCRIPTS / 'secret-scan.sh'), str(d / 'diff.patch')], check=False)
+        if scan.returncode:
+            out.write_text('VERDICT: REQUEST_CHANGES\n\nPR diff 含疑似凭据，未交给模型评审：\n' + scan.stdout)
+            reviewer = {'family': 'tool', 'model': 'secret-scan.sh', 'effort': '-'}
+        else:
+            code_dir = worktree if worktree and Path(worktree).is_dir() and run(
+                ['git', '-C', worktree, 'rev-parse', 'HEAD'], check=False).stdout.strip() == head else None
+            prompt = d / 'prompt.md'
+            prompt.write_text(review_prompt(pr, author_family, brief, report, code_dir, d / 'diff.patch',
+                                            out if reviewer['family'] == 'pi' else None))
+            run_reviewer(reviewer, prompt, out, code_dir or str(d), number)
+        verdict = parse_verdict(out)
+        record = {'pr': number, 'url': pr['url'], 'head': head, 'base': pr['baseRefName'], 'verdict': verdict,
+                  'author_family': author_family, 'reviewer': reviewer, 'reviewed_at': now(),
+                  'review': str(out), 'diff': str(d / 'diff.patch')}
+        verdict_file.write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n')
+        post_review(number, record, out)
+        notify(f'REVIEWED PR#{number} head {head[:9]}: {verdict}（{reviewer["family"]} {reviewer["model"]}）')
+        return record
+    finally:
+        (d / 'reviewing.pid').unlink(missing_ok=True)
+
+
+def review_prompt(pr, author_family, brief, report, code_dir, diff, out):
+    checklist = dispatchconf.file(CONF, 'review_checklist')
+    lines = [
+        f'你是 PR 的独立评审，不是作者。作者是 {author_family} 模型族，你来自另一个模型族。只读：不改文件、不 push、不评论 PR、不合入。',
+        f'用户目标和任务要求在作者收到的完整 brief：`{brief}`。先读它。',
+        f'PR：{pr["url"]}，head `{pr["headRefOid"]}`，base `{pr["baseRefName"]}`。完整 diff（对应这个 head）：`{diff}`。',
+    ]
+    if report and Path(report).exists():
+        lines.append(f'作者报告：`{report}`。报告里的说法要对照 diff 和证据核实，不要直接采信。')
+    if code_dir:
+        lines.append(f'当前目录是作者 worktree，HEAD 等于 PR head，可读源码上下文。')
+    if checklist and checklist.exists():
+        lines.append(f'按 `{checklist}` 逐条核对。')
+    lines += [
+        '判定：diff 是否完整实现 brief 的要求；有无 bug、回归、并发或幂等问题；有无凭据或用户数据泄露；测试是否证明行为而不是自证；证据是否对应这个 head。',
+        '只有找不到阻断问题时才 APPROVE。',
+        f'输出格式：第一行必须正好是 `VERDICT: APPROVE` 或 `VERDICT: REQUEST_CHANGES`，之后用中文逐条写理由，每条带 `文件:行号`。',
+    ]
+    if out:
+        lines.append(f'把评审全文写进 `{out}`。')
+    else:
+        lines.append('评审全文直接作为你的回复输出。')
+    return '\n\n'.join(lines) + '\n'
+
+
+def run_reviewer(reviewer, prompt, out, cwd, number):
+    if reviewer['family'] == 'claude':
+        tools = 'Read,Grep,Glob'
+        p = subprocess.run(['claude', '-p', '--model', reviewer['model'], '--effort', reviewer['effort'],
+                            '--tools', tools, '--allowedTools', tools, '--no-session-persistence',
+                            '--output-format', 'text'],
+                           cwd=cwd, input=prompt.read_text(), capture_output=True, text=True, timeout=3600)
+        if p.returncode:
+            raise Refused(f'claude 评审失败 (exit {p.returncode})')
+        out.write_text(p.stdout)
+    else:
+        code = subprocess.call(['sh', str(PI_WORKER), '--model', reviewer['model'], '--thinking', reviewer['effort'],
+                                '--readonly', '--cwd', cwd, *context_args(REPO),
+                                '--prompt-file', str(prompt), '--out', str(out),
+                                '--label', f'dispatch review-{number}', '--timeout-min', '60', '--idle-min', '12'])
+        if code:
+            raise Refused(f'pi 评审没有完成 (exit {code})')
+
+
+def parse_verdict(out):
+    text = out.read_text() if out.exists() else ''
+    first = next((l.strip().strip('`*') for l in text.splitlines() if l.strip()), '')
+    m = re.fullmatch(r'VERDICT:\s*(APPROVE|REQUEST_CHANGES)', first)
+    if not m:
+        raise Refused(f'评审输出第一行不是 VERDICT 结论，见 {out}')
+    return m[1]
+
+
+def post_review(number, record, out):
+    body = out.parent.parent / 'comment.md'
+    r = record['reviewer']
+    body.write_text(f'独立评审（{r["family"]} `{r["model"]}`，作者 {record["author_family"]}），'
+                    f'head `{record["head"]}`\n\n{out.read_text()}')
+    if run([str(SCRIPTS / 'secret-scan.sh'), str(body)], check=False).returncode:
+        print('评审正文含疑似凭据，不发到 PR', file=sys.stderr)
+        return
+    gh('pr', 'comment', str(number), '--body-file', str(body), check=False)
+
+
+def cmd_review(a):
+    if a.pr:
+        if not (a.author and a.brief):
+            raise Refused('--pr 需要 --author 和 --brief')
+        review(a.pr, a.author, a.brief, a.worktree, None, a.force)
+        return
+    state = load(a.name)
+    pr = find_pr(state['branch']) if state.get('branch') else None
+    if not pr:
+        raise Refused(f'{a.name} 的分支还没有 PR')
+    review(pr['number'], state['author_family'], str(worker_dir(a.name) / 'brief.md'),
+           state.get('worktree'), state['out'], a.force)
+
+
+def merge_gate(pr, verdict, merge_commit_bases=()):
+    """Pure decision: (allowed, reason, method, all_checks). Bases with these prefixes keep a merge commit."""
+    method, all_checks = ('merge', True) if pr['baseRefName'].startswith(tuple(merge_commit_bases)) else ('squash', False)
+    if pr['state'] != 'OPEN':
+        return False, f'PR 状态是 {pr["state"]}', method, all_checks
+    if not verdict:
+        return False, f'没有当前 head {pr["headRefOid"][:9]} 的独立评审结论；先 dispatch review', method, all_checks
+    if verdict['head'] != pr['headRefOid']:
+        return False, f'评审结论对应 head {verdict["head"][:9]}，当前 head 是 {pr["headRefOid"][:9]}', method, all_checks
+    if verdict['reviewer']['family'] in (verdict['author_family'], 'tool'):
+        return False, '评审与作者同一模型族，或只有工具结论', method, all_checks
+    if verdict['verdict'] != 'APPROVE':
+        return False, f'评审结论是 {verdict["verdict"]}，见 {verdict["review"]}', method, all_checks
+    return True, f'APPROVE（{verdict["reviewer"]["family"]} {verdict["reviewer"]["model"]}，{verdict["reviewed_at"]}）', method, all_checks
+
+
+def cmd_merge(a):
+    pr = json.loads(gh('pr', 'view', str(a.pr), '--json', 'number,headRefOid,baseRefName,state').stdout)
+    verdict_file = review_dir(a.pr, pr['headRefOid']) / 'verdict.json'
+    verdict = json.loads(verdict_file.read_text()) if verdict_file.exists() else None
+    ok, reason, method, all_checks = merge_gate(pr, verdict, dispatchconf.words(CONF, 'merge_commit_bases'))
+    if not ok:
+        stale = sorted(p.parent.name[:9] for p in (ROOT / 'reviews' / f'pr-{a.pr}').glob('*/verdict.json'))
+        raise Refused(f'合入门拒绝 PR#{a.pr}：{reason}' + (f'（已有旧 head 结论：{", ".join(stale)}）' if stale and not verdict else ''))
+    print(f'合入门放行 PR#{a.pr}：{reason}；base {pr["baseRefName"]} 用 --method {method}' + (' --all-checks' if all_checks else ''), flush=True)
+    script = CONF.get('merge_script')
+    if not script:
+        # No project merge script: GitHub refuses the merge if the head moved after the review.
+        args = ['gh', 'pr', 'merge', str(a.pr), f'--{method}', '--match-head-commit', verdict['head']]
+        if a.dry_run:
+            print('would run: ' + shlex.join(args))
+            return
+        run(args)
+        notify(f'MERGED PR#{a.pr} ({method})')
+        return
+    # The project's merge script, always the copy on origin/main (a branch cannot weaken its own gate).
+    run(['git', '-C', REPO, 'fetch', '-q', 'origin', 'main'])
+    mwg = ROOT / Path(script).name
+    mwg.write_text(run(['git', '-C', REPO, 'show', f'origin/main:{script}']).stdout)
+    args = ['node', str(mwg), str(a.pr), '--method', method] + (['--all-checks'] if all_checks else []) + (['--dry-run'] if a.dry_run else [])
+    heads = {verdict['head']}
+    proc = subprocess.Popen(args, cwd=REPO, stdout=subprocess.PIPE, text=True)
+    last = None
+    for line in proc.stdout:
+        print(line, end='', flush=True)
+        try:
+            last = json.loads(line)
+        except ValueError:
+            continue
+        if last.get('event') == 'updated':
+            heads.add(last['head'])  # the merge script verified it is a merge of the reviewed head and base
+        if last.get('event') == 'attempt' and last.get('head') not in heads:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait()
+            raise Refused(f'合入脚本读到的 head {last["head"][:9]} 不是评审过的 head，已中止')
+    if proc.wait():
+        raise Refused(f'合入脚本未合入：{(last or {}).get("reason", "见上方输出")}')
+    if last and last.get('event') == 'merged':
+        notify(f'MERGED PR#{a.pr} ({method})')
+
+
+def cmd_adopt(a):
+    blocks = json.loads(run(['rex', 'block', 'list', '--json']).stdout)
+    blocks = blocks if isinstance(blocks, list) else blocks.get('blocks', [])
+    match = [b for b in blocks if b['label'] in (f'pi {a.name}', f'dispatch {a.name}')]
+    if not match:
+        raise Refused(f'没有标签为「pi {a.name}」的面板')
+    block = match[0]['block_id']
+    legacy = Path('/private/tmp/pi-supervisor') / (re.sub(r'[^A-Za-z0-9]', '_', block) + '.sum')
+    if legacy.exists() and time.time() - legacy.stat().st_mtime < 120 and not a.force:
+        raise Refused('旧 pi-supervisor 两分钟内还在看这个面板；两个监管会对同一确认框各按一次回车。先停掉旧 supervisor，或加 --force')
+    with Lock(ROOT / '.lock'):
+        if worker_dir(a.name).exists():
+            raise Refused(f'{a.name} 已存在')
+        save({'name': a.name, 'adopted': True, 'block': block, 'label': match[0]['label'], 'out': a.out,
+              'branch': a.branch, 'author_family': 'pi', 'timeout_min': a.timeout, 'started_at': now()})
+    spawn_runner(a.name)
+    print(f'adopted {a.name}: pane {block}, out {a.out}')
+
+
+def cmd_clean(a):
+    state = load(a.name)
+    d = worker_dir(a.name)
+    pid = alive(d / 'runner.pid')
+    if pid and not a.force:
+        raise Refused(f'{a.name} 的监管进程还在跑（pid {pid}）；确认放弃就加 --force')
+    if pid:
+        os.killpg(pid, signal.SIGTERM)  # pi-worker's trap closes the pane
+    block_file = Path(state['out'] + '.block')
+    if block_file.exists():
+        run(['rex', 'block', 'close', block_file.read_text().strip()], check=False)
+    own_branch = state.get('branch') and not state.get('adopted')
+    pr = find_pr(state['branch']) if own_branch else None
+    if pr and pr['state'] == 'OPEN':
+        raise Refused(f'PR#{pr["number"]} 还开着；先合入或关闭再 clean')
+    if state.get('worktree') and Path(state['worktree']).exists():
+        run(['git', '-C', REPO, 'worktree', 'remove', *(['--force'] if a.force else []), state['worktree']])
+    if own_branch:
+        run(['git', '-C', REPO, 'branch', '-q', '-D', state['branch']], check=False)
+        gh('api', '-X', 'DELETE', f'repos/{{owner}}/{{repo}}/git/refs/heads/{state["branch"]}', check=False)
+    archive = ROOT / 'archive' / f'{a.name}-{now().replace(":", "")}'
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    d.rename(archive)
+    print(f'cleaned {a.name}; 状态归档到 {archive}')
+
+
+def describe(state, prs):
+    d = worker_dir(state['name'])
+    out = Path(state['out'])
+    exit_info = json.loads((d / 'exit.json').read_text()) if (d / 'exit.json').exists() else None
+    first = lambda p: p.read_text().splitlines()[0] if p.exists() and p.read_text().strip() else ''
+    pr = prs.get(state.get('branch'))
+    reviewing = pr and alive(review_dir(pr['number'], pr['headRefOid']) / 'reviewing.pid')
+    why = ''
+    if alive(d / 'runner.pid'):
+        if reviewing:
+            phase = '评审中'
+        elif Path(str(out) + '.needs-human').exists():
+            phase, why = '等人工', first(Path(str(out) + '.needs-human'))
+        elif Path(str(out) + '.stuck').exists():
+            phase, why = '卡住', first(Path(str(out) + '.stuck'))
+        else:
+            phase = '收卷中' if exit_info else '运行中'
+    elif exit_info is None:
+        phase, why = '监管已退出', '没有收卷记录；看 supervisor.log，必要时 dispatch adopt'
+    elif exit_info['scan']['exit']:
+        phase, why = '收卷被拦', f'令牌扫描 {len(exit_info["scan"]["hits"])} 处，见 exit.json'
+    else:
+        phase, why = {0: ('已收卷', ''), 124: ('超时', '面板保留'), 1: ('面板退出', '写 .done 前面板没了')}.get(
+            exit_info['code'], ('异常退出', f'exit {exit_info["code"]}'))
+    verdict = '-'
+    if pr:
+        f = review_dir(pr['number'], pr['headRefOid']) / 'verdict.json'
+        if f.exists():
+            v = json.loads(f.read_text())
+            verdict = f'{v["verdict"]}（{v["reviewer"]["family"]}）'
+        elif reviewing:
+            verdict = '评审中'
+        elif any((ROOT / 'reviews' / f'pr-{pr["number"]}').glob('*/verdict.json')):
+            verdict = '旧 head 的结论，需重评'
+        else:
+            verdict = '未评审'
+    started = datetime.datetime.strptime(state['started_at'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+    minutes = int((datetime.datetime.now(datetime.timezone.utc) - started).total_seconds() // 60)
+    return {
+        'name': state['name'], 'phase': phase, 'why': why,
+        'pr': f'#{pr["number"]} {pr["state"].lower()}{" draft" if pr["isDraft"] else ""} {pr["headRefOid"][:9]}' if pr else '-',
+        'verdict': verdict, 'card': state.get('card') or '-',
+        'ports': f'{state["ports"]["base"]}-{state["ports"]["last"]}' if state.get('ports') else '-',
+        'age': f'{minutes // 60}h{minutes % 60:02d}m',
+    }
+
+
+def cmd_status(a):
+    states = list(workers())
+    prs = {}
+    if any(s.get('branch') for s in states):
+        for pr in json.loads(gh('pr', 'list', '--state', 'all', '--limit', '200', '--json',
+                                'number,state,isDraft,headRefName,headRefOid,url,baseRefName').stdout):
+            prs.setdefault(pr['headRefName'], pr)
+    rows = [describe(s, prs) for s in states]
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        print('没有在跑的 worker')
+        return
+    cols = [('name', '任务'), ('phase', '阶段'), ('why', '卡住原因'), ('pr', 'PR'), ('verdict', '评审'),
+            ('card', '卡'), ('ports', '端口'), ('age', '已运行')]
+    print('| ' + ' | '.join(t for _, t in cols) + ' |')
+    print('|' + '---|' * len(cols))
+    for r in rows:
+        print('| ' + ' | '.join(r[k] or '-' for k, _ in cols) + ' |')
+
+
+DOTFILES = SCRIPTS.parent.parent
+# Installed path -> file in the dotfiles repo (home.nix links each one).
+INSTALLED = {
+    Path.home() / '.local/bin/dispatch': DOTFILES / 'home/dispatch/dispatch',
+    Path.home() / '.claude/bin/pi-worker': DOTFILES / 'home/dispatch/pi-worker',
+    Path.home() / '.claude/rules/pstack-models.md': DOTFILES / 'home/.claude/rules/pstack-models.md',
+}
+CONFIG_KEYS = {*REQUIRED, 'worktree_root', 'ports', 'worker_model', 'worker_thinking', 'role_brief',
+               'review_checklist', 'merge_script', 'merge_commit_bases', 'card_command', 'card_env', 'card_log',
+               'protected_branches', 'temp_dirs', 'temp_containers', 'db_wrapper', 'secret_fixture_passwords'}
+SHIM_MARK = '.dotfiles/home/dispatch/'
+
+
+class Doctor:
+    def __init__(self):
+        self.failed = 0
+
+    def say(self, level, area, text):
+        self.failed += level == 'FAIL'
+        print(f'{level:4}  {area:8} {text}')
+
+
+def same_file(a, b):
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
+
+
+def compare_dir(doc, directory):
+    """Same-named files in an old scripts directory: identical, a shim, or a local change to merge back."""
+    for local in sorted(Path(directory).iterdir()):
+        repo = SCRIPTS / local.name
+        if not local.is_file() or not repo.is_file():
+            continue
+        if same_file(local, repo):
+            doc.say('WARN', 'drift', f'{local} 与仓库相同，是旧副本；改成薄 shim 或删除')
+        elif SHIM_MARK in local.read_text(errors='replace'):
+            doc.say('OK', 'drift', f'{local} 是指向仓库的 shim')
+        else:
+            doc.say('WARN', 'drift', f'{local} 与仓库不同，可能是本机独有改进：diff -u {repo} {local}')
+
+
+def doctor_repo(doc):
+    git = lambda *args: run(['git', '-C', DOTFILES, *args], check=False)
+    if git('rev-parse', '--show-toplevel').returncode:
+        doc.say('FAIL', 'repo', f'{SCRIPTS} 不在 dotfiles git 仓库里')
+        return
+    head = git('rev-parse', '--short', 'HEAD').stdout.strip()
+    branch = git('branch', '--show-current').stdout.strip() or 'detached'
+    fetched = run(['git', '-C', DOTFILES, 'fetch', '-q', 'origin', 'main'], check=False).returncode == 0
+    counts = git('rev-list', '--left-right', '--count', 'HEAD...origin/main').stdout.split()
+    ahead, behind = (int(c) for c in counts) if len(counts) == 2 else (0, 0)
+    upstream = git('rev-parse', '--short', 'origin/main').stdout.strip()
+    level = 'WARN' if behind or not fetched else 'OK'
+    doc.say(level, 'version', f'本机 {DOTFILES} {branch}@{head}；仓库 origin/main@{upstream}'
+            f'{"（fetch 失败，用的是上次的 origin/main）" if not fetched else ""}；领先 {ahead}，落后 {behind}'
+            + ('；git pull 后 ./rebuild.sh' if behind else ''))
+    if ahead:
+        doc.say('WARN', 'version', f'有 {ahead} 个本地提交没进 origin/main：git -C {DOTFILES} log origin/main..HEAD')
+    dirty = git('status', '--porcelain', '--', 'home/dispatch', 'home/.claude/rules', 'tests').stdout.splitlines()
+    for line in dirty:
+        doc.say('WARN', 'version', f'未提交的本机改动 {line[3:]}：通用改进提 PR 合回 dotfiles')
+
+
+def doctor_install(doc, compare):
+    """compare collects old helper directories named by local pi-worker copies."""
+    for installed, repo in INSTALLED.items():
+        if installed.is_symlink() and installed.resolve() == repo.resolve():
+            doc.say('OK', 'install', f'{installed} -> 仓库')
+        elif installed.is_symlink():
+            doc.say('FAIL', 'install', f'{installed} 链到 {os.readlink(installed)}，不是本仓库；./rebuild.sh')
+        elif installed.is_file() and same_file(installed, repo):
+            doc.say('WARN', 'install', f'{installed} 是与仓库相同的副本；移走后 ./rebuild.sh 换成链接')
+        elif installed.is_file():
+            doc.say('WARN', 'drift', f'{installed} 是本机副本且与仓库不同：diff -u {repo} {installed}；'
+                    '通用改进合回仓库，项目特定的值移进 dispatch.config，再移走它 ./rebuild.sh')
+            m = re.search(r'(?m)^PI_SCRIPTS=(/\S+)$', installed.read_text(errors='replace'))
+            if m and Path(m[1]).is_dir():
+                compare.add(Path(m[1]).resolve())  # an old pi-worker copy names its helper directory
+        else:
+            doc.say('FAIL', 'install', f'{installed} 不存在；./rebuild.sh')
+    bin_dir = Path.home() / '.claude/bin'
+    for extra in sorted(bin_dir.iterdir()) if bin_dir.is_dir() else []:
+        if extra in INSTALLED or not extra.is_file():
+            continue
+        repo = SCRIPTS / extra.name
+        if same_file(extra, repo):
+            doc.say('WARN', 'drift', f'{extra} 与仓库 {repo.name} 相同，已由仓库提供，可删除')
+        elif repo.exists():
+            doc.say('WARN', 'drift', f'{extra} 与仓库不同：diff -u {repo} {extra}')
+        else:
+            doc.say('WARN', 'drift', f'{extra} 不在仓库里（本机独有工具或备份）')
+    found = shutil.which('dispatch')
+    link = next(iter(INSTALLED))
+    if link.exists() and (not found or Path(found).resolve() != SCRIPTS / 'dispatch'):
+        doc.say('WARN', 'install', f'PATH 上的 dispatch 是 {found or "无"}；把 {link.parent} 加进 PATH')
+
+
+def doctor_config(doc):
+    p = dispatchconf.path()
+    source = 'DISPATCH_CONFIG' if os.environ.get('DISPATCH_CONFIG') else '默认路径'
+    try:
+        conf = dispatchconf.load()
+    except (OSError, ValueError) as e:
+        doc.say('FAIL', 'config', f'{p} 无法读取：{e}')
+        return {}
+    if not conf:
+        doc.say('FAIL', 'config', f'{p}（{source}）不存在：从 {SCRIPTS / "dispatch.config.example"} 复制并填写')
+        return {}
+    doc.say('OK', 'config', f'{p}（{source}{"，链到 " + str(p.resolve()) if p.is_symlink() else ""}）')
+    for key in sorted(set(conf) - CONFIG_KEYS):
+        if not key.startswith('secret_pattern.'):
+            doc.say('WARN', 'config', f'未知配置项 {key}（拼错了？）')
+    for key in REQUIRED:
+        if not conf.get(key):
+            doc.say('FAIL', 'config', f'缺少 {key}')
+    for key in ('repo', 'state_dir', 'evidence_dir', 'role_brief', 'review_checklist', 'card_log'):
+        f = dispatchconf.file(conf, key)
+        if f and not f.exists():
+            doc.say('FAIL' if key in REQUIRED else 'WARN', 'config', f'{key} = {f} 不存在')
+    repo = dispatchconf.file(conf, 'repo')
+    if repo and repo.exists():
+        if run(['git', '-C', repo, 'remote', 'get-url', 'origin'], check=False).returncode:
+            doc.say('FAIL', 'config', f'repo {repo} 不是带 origin 的 git 仓库')
+        elif conf.get('merge_script') and run(['git', '-C', repo, 'cat-file', '-e',
+                                                f'origin/main:{conf["merge_script"]}'], check=False).returncode:
+            doc.say('FAIL', 'config', f'origin/main 上没有 merge_script {conf["merge_script"]}')
+    first, _, last = conf.get('ports', '3110-3999').partition('-')
+    if not (first.isdigit() and (not last or last.isdigit())):
+        doc.say('FAIL', 'config', f'ports = {conf["ports"]} 应写成 起-止')
+    if conf.get('card_command') and '{title}' not in conf['card_command']:
+        doc.say('WARN', 'config', 'card_command 里没有 {title} 占位符')
+    return conf
+
+
+def doctor_deps(doc, conf):
+    needed = ['python3', 'git', 'gh', 'pi', 'rex', 'lsof', 'osascript', 'sandbox-exec', 'realpath']
+    optional = {'op': '凭据读取'}
+    if conf.get('merge_script', '').endswith(('.mjs', '.js')):
+        needed.append('node')
+    if conf.get('card_command'):
+        needed.append(shlex.split(conf['card_command'])[0])
+    try:
+        families = {reviewer_for(f)['family'] for f in ('pi', 'claude')}
+        doc.say('OK', 'models', f'{MODELS} 的「{REVIEW_ROLE}」可跨族评审')
+        if 'claude' in families:
+            needed.append('claude')
+    except (Refused, OSError) as e:
+        doc.say('FAIL', 'models', str(e))
+    for tool in needed:
+        path = shutil.which(tool)
+        doc.say('OK' if path else 'FAIL', 'deps', f'{tool} {path or "不在 PATH 上"}')
+    for tool, why in optional.items():
+        doc.say('OK' if shutil.which(tool) else 'WARN', 'deps', f'{tool}（{why}）{shutil.which(tool) or "不在 PATH 上"}')
+    if shutil.which('gh') and run(['gh', 'auth', 'status'], check=False).returncode:
+        doc.say('FAIL', 'deps', 'gh 没有登录：gh auth login')
+
+
+def cmd_doctor(a):
+    doc = Doctor()
+    doctor_repo(doc)
+    compare = {Path(d).resolve() for d in a.compare}
+    doctor_install(doc, compare)
+    for directory in sorted(compare):
+        compare_dir(doc, directory)
+    conf = doctor_config(doc)
+    doctor_deps(doc, conf)
+    print(f'\n{"有 " + str(doc.failed) + " 项 FAIL" if doc.failed else "没有 FAIL"}；WARN 是建议处理的漂移或缺口')
+    sys.exit(1 if doc.failed else 0)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='dispatch', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('start')
+    s.add_argument('name')
+    s.add_argument('brief')
+    s.add_argument('--base', default='main')
+    s.add_argument('--branch')
+    s.add_argument('--common')
+    g = s.add_mutually_exclusive_group()
+    g.add_argument('--card')
+    g.add_argument('--new-card', metavar='TITLE')
+    s.add_argument('--timeout', type=int, default=180)
+    s.add_argument('--model')
+    s.add_argument('--thinking')
+    s.add_argument('--dry-run', action='store_true')
+    s = sub.add_parser('status')
+    s.add_argument('--json', action='store_true')
+    s = sub.add_parser('wait')
+    s.add_argument('cursor', nargs='?')
+    s = sub.add_parser('review')
+    s.add_argument('name', nargs='?')
+    s.add_argument('--pr', type=int)
+    s.add_argument('--author', choices=['pi', 'claude'])
+    s.add_argument('--brief')
+    s.add_argument('--worktree')
+    s.add_argument('--force', action='store_true')
+    s = sub.add_parser('merge')
+    s.add_argument('pr', type=int)
+    s.add_argument('--dry-run', action='store_true')
+    s = sub.add_parser('adopt')
+    s.add_argument('name')
+    s.add_argument('--out', required=True)
+    s.add_argument('--branch')
+    s.add_argument('--timeout', type=int, default=180)
+    s.add_argument('--force', action='store_true')
+    s = sub.add_parser('clean')
+    s.add_argument('name')
+    s.add_argument('--force', action='store_true')
+    s = sub.add_parser('doctor')
+    s.add_argument('--compare', action='append', default=[], metavar='DIR',
+                   help='也对比这个旧脚本目录里的同名文件')
+    s = sub.add_parser('_run')
+    s.add_argument('name')
+    a = ap.parse_args()
+    if a.cmd == 'wait':
+        os.execv('/bin/sh', ['sh', str(SCRIPTS / 'pi-events-wait.sh'), *([a.cursor] if a.cursor else [])])
+    if a.cmd == 'review' and not (a.name or a.pr):
+        ap.error('review 需要 NAME 或 --pr')
+    if a.cmd == 'doctor':
+        cmd_doctor(a)
+    try:
+        configure()
+        {'start': cmd_start, 'status': cmd_status, 'review': cmd_review, 'merge': cmd_merge,
+         'adopt': cmd_adopt, 'clean': cmd_clean, '_run': cmd_run}[a.cmd](a)
+    except Refused as e:
+        print(f'dispatch: {e}', file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

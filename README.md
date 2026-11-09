@@ -31,6 +31,7 @@ Running the switch builds:
 - Terminal (WezTerm config with the rose-pine moon theme and dimmed unfocused windows)
 - Agent configs (Claude, Codex, opencode all share one AGENTS.md)
 - Optional Pi theme and local extensions, generic UI settings and model overrides, plus two deliberately pinned third-party Pi packages
+- Pi worker dispatch: `dispatch` and `pi-worker` for running supervised pi workers with cross-model review and a merge gate (see [`home/dispatch/README.md`](home/dispatch/README.md)); project values stay in a local config
 
 ## Prerequisites
 

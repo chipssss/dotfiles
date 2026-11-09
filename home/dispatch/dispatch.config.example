@@ -1,0 +1,51 @@
+# dispatch project config. Copy to ~/.config/dispatch/config (or point $DISPATCH_CONFIG at your copy)
+# and keep the real values on your machine: this file is the only place project details live.
+# Format: `key = value`, one per line; lines starting with # are comments (no trailing comments).
+# ~ expands in paths.
+
+# Required. The git repo workers branch from (origin must be GitHub), where dispatch keeps
+# workers/ reviews/ archive/, and where each worker writes <evidence_dir>/<NAME>/result.md.
+repo = ~/code/example-project
+state_dir = ~/code/example-notes/dispatch
+evidence_dir = ~/code/example-notes/evidence
+
+# Optional, defaults shown.
+# worktree_root = /private/tmp/dispatch-wt
+# One 10-port block per worker.
+# ports = 3110-3999
+# worker_model = openai/gpt-6.1-sol
+# worker_thinking = high
+
+# Optional brief parts. role_brief is prepended to every task brief (unless the task already
+# contains its first line); review_checklist is handed to the cross-family reviewer.
+# role_brief = ~/code/example-notes/briefs/worker-role.md
+# review_checklist = ~/code/example-notes/briefs/review-checklist.md
+
+# Optional merge script, read from origin/main of repo. It takes
+# `PR --method squash|merge [--all-checks] [--dry-run]` and prints JSON lines with
+# `attempt`/`updated`/`merged` events carrying `head`. Without it, dispatch merge runs
+# `gh pr merge --squash --match-head-commit <reviewed head>`.
+# merge_script = scripts/merge.mjs
+# Base-branch prefixes that keep a merge commit and wait for all checks.
+# merge_commit_bases = stack/
+
+# Optional work-card tracker for `dispatch start --new-card TITLE`. The command must print JSON
+# with `identifier` (and `id`); {title} becomes "NAME · TITLE". card_env adds KEY=VALUE pairs.
+# card_command = example-tracker issue create --title {title} --project EXAMPLE --output json
+# card_env = EXAMPLE_FLAG=1
+# card_log = ~/code/example-notes/cards.txt
+
+# Approval rules for pi confirmations (pi-worker reads this file too).
+# Pushes to these branches (fnmatch patterns, e.g. release/*) always wait for a human.
+# protected_branches = main master
+# Recursive deletes under these prefixes are auto-approved.
+# temp_dirs = /tmp/ /private/tmp/ .tmp/
+# `docker rm` of containers with these name prefixes is auto-approved (none by default).
+# temp_containers = tmp-
+# The one script allowed to run psql with credentials (none by default: such commands wait for a human).
+# db_wrapper = scripts/readonly-psql.sh
+
+# Extra secret-scanner patterns (Python regex), one key per pattern: secret_pattern.<label>.
+# secret_pattern.example-token = \bexample_[A-Za-z0-9]{20,}
+# Loopback test-fixture passwords that are not secrets.
+# secret_fixture_passwords = postgres synthetic
