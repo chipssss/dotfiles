@@ -27,6 +27,7 @@ import time
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
+sys.dont_write_bytecode = True
 import dispatchconf
 
 DOTFILES = SCRIPTS.parent.parent
@@ -333,12 +334,16 @@ def cmd_clean(a):
 
 
 class Doctor:
-    def __init__(self):
+    def __init__(self, json_mode=False):
         self.failed = 0
+        self.json_mode = json_mode
+        self.checks = []
 
     def say(self, level, area, text):
         self.failed += level == 'FAIL'
-        print(f'{level:4}  {area:8} {text}')
+        self.checks.append(dict(level=level, area=area, text=text))
+        if not self.json_mode:
+            print(f'{level:4}  {area:8} {text}')
 
 
 def same_file(a, b):
@@ -364,12 +369,27 @@ def compare_dir(doc, directory):
 
 
 def cmd_doctor(a):
-    doc = Doctor()
-    conf = dispatchconf.load()
-    dispatchconf.approval_policy(conf)
+    doc = Doctor(a.json)
+    config_sha256 = None
+    try:
+        conf = dispatchconf.load()
+        dispatchconf.approval_policy(conf)
+        # Hash effective policy, not its path, comments or presentation whitespace.
+        effective = dict(ports='3110-3999', approval_mode='strict', protected_branches='',
+                         temp_dirs='/tmp/ /private/tmp/ .tmp/', secret_fixture_passwords='postgres synthetic')
+        effective.update(conf)
+        for key in ('protected_branches', 'temp_dirs', 'secret_fixture_passwords'):
+            effective[key] = sorted(set(dispatchconf.words(effective, key)))
+        effective['protected_branches'] = sorted(set(['main', 'master', *effective['protected_branches']]))
+        config_sha256 = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()
+    except (OSError, ValueError):
+        doc.say('FAIL', 'config', '配置缺失、无效或策略不完整')
     head = run(['git', '-C', DOTFILES, 'rev-parse', 'HEAD']).stdout.strip()
+    dirty = bool(run(['git', '-C', DOTFILES, 'status', '--porcelain', '--untracked-files=normal']).stdout)
     doc.say('OK', 'version', f'{DOTFILES} HEAD {head}')
-    doc.say('OK', 'config', str(dispatchconf.path()))
+    if config_sha256:
+        doc.say('OK', 'config', str(dispatchconf.path()))
+    doc.say('WARN' if dirty else 'OK', 'checkout', '有未提交改动' if dirty else '干净')
     fingerprints = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(SCRIPTS.iterdir()) if p.is_file()}
     deps, versions = {}, {}
     for tool in ['python3', 'git', 'pi', 'rex', 'lsof', 'osascript', 'sandbox-exec', 'realpath']:
@@ -382,19 +402,30 @@ def cmd_doctor(a):
             except subprocess.TimeoutExpired:
                 versions[tool] = 'version probe timed out'
             doc.say('OK', 'version', f'{tool}: {versions[tool]}')
+    install = {}
     for installed, source in [(Path.home() / '.local/bin/dispatch', SCRIPTS / 'dispatch'),
                               (Path.home() / '.claude/bin/pi-worker', PI_WORKER)]:
+        kind = 'symlink' if installed.is_symlink() else 'copy' if installed.is_file() else 'missing'
+        status = 'drifted'
         if installed.is_symlink() and installed.resolve() == source:
+            status = 'linked'
             doc.say('OK', 'install', f'{installed}: 仓库链接')
         elif same_file(installed, source):
+            status = 'identical-copy'
             doc.say('WARN', 'install', f'{installed}: 相同副本，尚未部署为链接')
         else:
+            if kind == 'missing':
+                status = 'missing'
             doc.say('WARN', 'drift', f'{installed}: 尚未安装或与当前 checkout 不同；部署前 diff -u {source} {installed}')
+        install[source.name] = dict(path=str(installed), kind=kind, status=status)
     for directory in a.compare:
         compare_dir(doc, directory)
     if a.json:
-        print(json.dumps({'head': head, 'files': fingerprints, 'dependencies': deps, 'versions': versions}, sort_keys=True, indent=2))
-    print(f'FAIL count: {doc.failed}')
+        print(json.dumps(dict(head=head, files=fingerprints, dependencies=deps, versions=versions,
+                              config_sha256=config_sha256, dirty=dirty, install=install,
+                              checks=doc.checks, fail_count=doc.failed), sort_keys=True, indent=2))
+    else:
+        print(f'FAIL count: {doc.failed}')
     return 1 if doc.failed else 0
 
 

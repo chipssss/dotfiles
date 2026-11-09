@@ -18,7 +18,7 @@ completion_check() {
   mkdir "$completion_lock" 2>/dev/null || return 1
   completion_n=0
   [ ! -f "$completion_count" ] || read -r completion_n < "$completion_count"
-  completion_problem='result.md 是空的，请重写完整报告（太长就分段追加），确认非空后再写 .done'
+  completion_problem="$(basename -- "$completion_out") 是空的，请重写完整报告（太长就分段追加），确认非空后再写 .done"
   if [ -f "$completion_out.done" ] && [ -s "$completion_out" ]; then
     if completion_problem=$(completion_evidence_safe "$completion_out"); then
       rmdir "$completion_lock"

@@ -142,7 +142,7 @@ while :; do
     notify "RESOLVED $name: 确认框已处理，继续监管"
   fi
   if [ "$completed" = 2 ]; then
-    set_stuck "result.md 为空，重写已达 3 次；补好非空报告和 .done 后自动收卷"
+    set_stuck "$(basename -- "$out") 为空或产出未通过安全扫描，重写已达 3 次；补好安全非空报告和 .done 后自动收卷"
     sleep 10
     continue
   fi

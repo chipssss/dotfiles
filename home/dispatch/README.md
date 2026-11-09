@@ -81,33 +81,56 @@ Automatic push approval reads **local Git configuration, never the network**:
 Deletion approval resolves real paths, checks directory boundaries and checks every
 symlink component. Escaping a temporary root and linking back is refused. A `.tmp`
 root cannot itself be a symlink. Multiple deletion targets must all be safe.
-Compounds are not approximated with a substring match: every segment must be safe,
-and since this parser cannot prove a shell AST, **all compounds, expansions and
-redirections wait for a human**, including apparently safe ones. Database/container
+This parser cannot prove a shell AST, so **all compounds, expansions and
+redirections wait for a human**, including apparently safe ones. For simple commands,
+only the executable word can trigger the process-command-line reason: `ps` and
+`pgrep -f/-l/-a` (including long options and known system paths). `docker ps`,
+PID-only `pgrep -x`, and `ps` in branch names or deletion paths do not trigger it.
+Non-push/rm commands still need a human, with a generic reason. Database/container
 operations and hosted-PR mutations have no automatic allowlist here.
 
 ## Two-machine comparison and tests
 
 ```sh
 dispatch doctor --compare /path/to/old/helpers
-dispatch doctor --json > /tmp/dispatch-machine.txt
-# Compare that report with the other machine's report, especially HEAD and file hashes.
+dispatch doctor --json > /tmp/dispatch-machine.json
+# Copy the other machine's JSON report to /tmp/dispatch-other.json, then:
+python3 - /tmp/dispatch-machine.json /tmp/dispatch-other.json <<'PY'
+import json, sys
+left, right = [json.load(open(p)) for p in sys.argv[1:]]
+for key in ('head', 'files', 'config_sha256', 'dirty', 'install', 'versions', 'dependencies'):
+    if left[key] != right[key]:
+        print(key, 'differs')
+PY
 for t in tests/dispatch*.test.sh; do bash "$t"; done
 python3 tests/dotfiles-public-check --base BASE_SHA
 ```
 
-Doctor reports the exact checkout SHA, helper SHA-256 fingerprints, dependency paths,
-missing dependencies and hand-installed copy drift. Missing/different installation is
-a WARN before deployment, not proof that this new checkout is installed. FAIL means
-invalid safety policy or a missing runtime dependency. Matching shell comments are
-never accepted as evidence that a helper forwards to the repository.
+Doctor's `--json` stdout is one JSON document, without text prefixes or suffixes.
+It reports the checkout `head`, helper `files` hashes, dependency paths and versions,
+`dirty` (tracked changes or untracked, non-ignored files), and `install` status for
+`dispatch` and `pi-worker`: `linked`, `identical-copy`, `drifted` or `missing`.
+`config_sha256` hashes effective configuration with defaults, ignoring comments,
+key order and whitespace in list settings; it does not expose configuration values.
+Invalid policy produces a null fingerprint and a FAIL check even in JSON mode.
+`checks` and `fail_count` retain diagnostics. Installation paths and dependency paths
+can naturally differ between machines; compare status/version as well as hashes.
+Missing/different installation is a WARN before deployment, not proof that this new
+checkout is installed. FAIL means invalid safety policy or a missing runtime dependency.
+Matching shell comments are never accepted as evidence that a helper forwards to the
+repository. Doctor does not modify either installation.
 
 The public release check under `tests/` examines only **this dotfiles checkout's**
 diff, commit messages and author/committer identities. It is not part of worker
 startup or collection, and is not a reusable public-PR gate. Existing historical
 metadata is not rewritten. Choose the new-commit base explicitly.
 
-The credential scanner covers known vendor formats, private keys, JWTs and credential
-URLs, including nested/binary output; local fixture exceptions only apply on loopback.
-It prints locations/categories, never matched values. Custom regexes are finite checks,
-not proof that arbitrary data is non-secret. Human inspection remains necessary.
+The credential scanner checks OpenAI/Anthropic API key shapes, GitHub tokens,
+`BEGIN ... PRIVATE KEY` headers, three-part JWT-shaped strings, and generic
+`scheme://user:password@host.invalid/path`-shaped URLs, including nested/binary output. Password URLs
+on reserved `.invalid` hosts are fixtures; on loopback (`localhost`, `127.0.0.1`,
+`[::1]`) only configured fixture passwords are exempt. Other loopback passwords
+are still flagged. URLs without a password are not flagged by this rule.
+It prints locations/categories, never matched values. These patterns and custom
+regexes are finite checks, not proof that arbitrary data is non-secret. Human
+inspection remains necessary.

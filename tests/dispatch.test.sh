@@ -21,7 +21,7 @@ scripts = Path(os.environ['PI_SCRIPTS'])
 root = Path(tempfile.mkdtemp(prefix='DISPATCH-test-', dir='/private/tmp'))
 passed = 0
 config = root / 'dispatch.config'
-config.write_text('''protected_branches = main stack/* shared/* release/*
+config.write_text('''protected_branches = main shared/* release/*
 temp_dirs = /tmp/ /private/tmp/ .tmp/
 secret_pattern.demo token = \\bdemo_[A-Za-z0-9_-]{20,}
 secret_fixture_passwords = postgres synthetic

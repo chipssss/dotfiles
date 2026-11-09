@@ -44,10 +44,6 @@ kind = match[1]
 command = text[match.end():menu.start()].strip()
 # A capture is not a shell AST. Do not guess at soft wrapping, nested shells,
 # expansions, redirects or compound commands. Each needs human authorization.
-if re.search(r'\b(?:ps|pgrep)\b', command):
-    deny('进程命令行查询需要人工确认')
-if re.search(r'(?<![\w-])psql(?:\s|$)', command):
-    deny('数据库命令需要人工确认')
 if any(c in command for c in '\n\r;&|<>$`()\\'):
     deny('复合命令、展开或重定向需要人工确认')
 try:
@@ -63,6 +59,16 @@ if exe in ('/bin/rm', '/usr/bin/rm'):
 if exe in ('/usr/bin/git', '/bin/git'):
     exe = 'git'
 args = words[1:]
+# Inspect only known executable words, never parameters, branch names or paths.
+# Compound/nested shell syntax has already gone to a human above.
+if exe in ('ps', '/bin/ps', '/usr/bin/ps') or (
+    exe in ('pgrep', '/bin/pgrep', '/usr/bin/pgrep') and any(
+        arg in ('--full', '--list-name', '--list-full') or
+        (arg.startswith('-') and not arg.startswith('--') and any(c in arg[1:] for c in 'fla'))
+        for arg in args
+    )
+):
+    deny('进程命令行查询需要人工确认')
 cwd = os.environ.get('PI_APPROVE_CWD')
 
 

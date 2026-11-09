@@ -1,7 +1,8 @@
 #!/bin/sh
 # usage: secret-scan.sh PATH... - 0 = clean, 1 = credential-shaped data found, 2 = input/scan error.
 # Prints only path:line: kind, never the matched value. Scans nested and binary outputs too.
-# Built-in patterns are vendor formats; a project adds its own with secret_pattern.<label> in dispatch.config.
+# Built-in patterns cover vendor tokens, private keys, JWTs and password URLs.
+# Add custom formats with secret_pattern.<label> in dispatch.config.
 [ $# -gt 0 ] || { echo "usage: secret-scan.sh PATH..." >&2; exit 2; }
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 exec python3 -I - "$here" "$@" <<'PY'
@@ -20,9 +21,10 @@ except (OSError, ValueError, re.error) as e:
     sys.exit(2)
 
 PATTERNS = [
+    ('私钥', re.compile(rb'-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----')),
     ('OpenAI API key', re.compile(rb'\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}')),
     ('Anthropic API key', re.compile(rb'\bsk-ant-(?:api\d+-)?[A-Za-z0-9_-]{32,}')),
-    ('带密码的 Postgres URL', re.compile(rb'postgres(?:ql)?://[^\s:@/\'"]+:(?P<pw>[^\s@/\'"]+)@(?P<host>\[[^\]]+\]|[^\s:/\'"]*)')),
+    ('带密码的 URL', re.compile(rb'\b[a-z][a-z0-9+.-]*://[^\s:@/\'"]+:(?P<pw>[^\s@/\'"]+)@(?P<host>\[[^\]]+\]|[^\s:/?#@\'"]+)', re.IGNORECASE)),
     ('JWT', re.compile(rb'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])')),
     ('GitHub 令牌', re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})')),
 ] + extra
@@ -34,6 +36,7 @@ def fixture(match):
     host = match.groupdict().get('host')
     if host is None:
         return False
+    host = host.lower()
     if host.endswith(b'.invalid'):
         return True
     return host in (b'localhost', b'127.0.0.1', b'[::1]') and match['pw'] in FIXTURE_PASSWORDS
