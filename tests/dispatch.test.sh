@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resident pi-worker supervision, dispatch gates and the secret scanner, with a fake Rex transport.
+# Resident pi-worker supervision, conservative approval and the scanner, with fake Rex.
 # Never touches live panes, GitHub or credentials.
 set -eu
 # shellcheck source=tests/lib.sh
@@ -23,8 +23,6 @@ passed = 0
 config = root / 'dispatch.config'
 config.write_text('''protected_branches = main stack/* shared/* release/*
 temp_dirs = /tmp/ /private/tmp/ .tmp/
-temp_containers = tmp-
-db_wrapper = scripts/readonly-psql.sh
 secret_pattern.demo token = \\bdemo_[A-Za-z0-9_-]{20,}
 secret_fixture_passwords = postgres synthetic
 ''')
@@ -171,40 +169,30 @@ elif args[:2]==['block','send']:
     finally:
         if proc.poll() is None: proc.terminate()
 
-    loader = importlib.machinery.SourceFileLoader('dispatch', str(scripts / 'dispatch'))
-    spec = importlib.util.spec_from_loader('dispatch', loader)
-    dispatch = importlib.util.module_from_spec(spec); loader.exec_module(dispatch)
-    head, old = 'a' * 40, 'b' * 40
-    pr = lambda base='main', state='OPEN': {'baseRefName': base, 'baseRefOid': old, 'headRefOid': head, 'state': state}
-    v = lambda verdict='APPROVE', h=head, fam='anthropic', author='openai', base='main': {
-        'head': h, 'base': base, 'base_sha': old, 'verdict': verdict, 'author_family': author,
-        'author_model': 'openai/gpt-6.1-sol' if author == 'openai' else 'anthropic/claude-opus-4-6',
-        'review': 'r.md', 'reviewed_at': 't',
-        'reviewer': {'family': fam, 'model': 'openai/gpt-6.1-sol' if fam == 'openai' else 'claude-opus-4-6'}}
-    for name, args, ok, method in [
-        ('无结论拒绝', (pr(), None), False, 'squash'),
-        ('旧 head 结论拒绝', (pr(), v(h=old)), False, 'squash'),
-        ('REQUEST_CHANGES 拒绝', (pr(), v('REQUEST_CHANGES')), False, 'squash'),
-        ('同族评审拒绝', (pr(), v(fam='openai')), False, 'squash'),
-        ('只有工具结论拒绝', (pr(), v(fam='tool')), False, 'squash'),
-        ('已关闭 PR 拒绝', (pr(state='CLOSED'), v()), False, 'squash'),
-        ('main 上 APPROVE 放行，squash', (pr(), v()), True, 'squash'),
-        ('Anthropic 作者 + OpenAI 评审放行', (pr(), v(fam='openai', author='anthropic')), True, 'squash'),
-        ('stack/* 强制 merge commit 与 all-checks', (pr('stack/identity'), v(base='stack/identity')), True, 'merge'),
+    # Real supervisor transport: rejected tag/config pushes must never send enter.
+    subprocess.run(['git', '-C', str(feature), 'tag', 'v9'], check=True)
+    for label, command, mapping in [
+        ('tag-keyword', 'git push origin tag v9', None),
+        ('tag-bare', 'git push origin v9', None),
+        ('tag-ref', 'git push origin HEAD:refs/tags/v9', None),
+        ('tags-option', 'git push --tags', None),
+        ('follow-tags', 'git push --follow-tags', None),
+        ('mapped-main', 'git push origin dispatch/demo', 'refs/heads/dispatch/demo:refs/heads/main'),
+        ('mapped-wildcard', 'git push', 'refs/heads/*:refs/heads/*'),
     ]:
-        allowed, reason, m, all_checks = dispatch.merge_gate(*args, ['stack/'])
-        check(allowed == ok and m == method and all_checks == (method == 'merge'), f'合入门：{name}（{reason}）')
-    dispatch.MODELS = Path(os.environ['ROOT']) / 'home/.claude/rules/pstack-models.md'
-    check(dispatch.reviewer_for('openai')['family'] == 'anthropic', 'OpenAI 作者配 Anthropic 评审')
-    check(dispatch.reviewer_for('anthropic')['family'] == 'openai', 'Anthropic 作者配 OpenAI 评审')
-    for text, expected in [('VERDICT: APPROVE\n理由', 'APPROVE'), ('\n`VERDICT: REQUEST_CHANGES`\n', 'REQUEST_CHANGES'),
-                           ('看起来不错\nVERDICT: APPROVE', None), ('VERDICT: LGTM', None)]:
-        f = root / 'verdict.md'; f.write_text(text)
+        if mapping:
+            subprocess.run(['git', '-C', str(feature), 'config', 'remote.origin.push', mapping], check=True)
+        proc, state, out, events, keys, log = launch(label, cwd=feature)
         try:
-            got = dispatch.parse_verdict(f)
-        except dispatch.Refused:
-            got = None
-        check(got == expected, f'结论解析 {text!r} -> {expected}')
+            check(wait_for(lambda: (state / 'calls').exists()), label + ' 启动')
+            (state / 'screen').write_text(ask('git push', command))
+            check(wait_for(lambda: 'NEEDS HUMAN' in events()) and keys() == '', label + ' 不按回车')
+            (state / 'screen').write_text('─\n─')
+            finish(proc, state, out, events, log, label)
+        finally:
+            if proc.poll() is None: proc.terminate(); proc.wait(timeout=3)
+            if mapping:
+                subprocess.run(['git', '-C', str(feature), 'config', '--unset-all', 'remote.origin.push'], check=True)
 
     scan_dir = root / 'scan'; scan_dir.mkdir()
     token = 'demo_' + 'FAKE' * 8

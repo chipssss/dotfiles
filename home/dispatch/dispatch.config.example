@@ -1,57 +1,21 @@
-# dispatch project config. Copy to ~/.config/dispatch/config (or point $DISPATCH_CONFIG at your copy)
-# and keep the real values on your machine: this file is the only place project details live.
-# Format: `key = value`, one per line; lines starting with # are comments (no trailing comments).
-# ~ expands in paths.
+# Shared machine policy. Copy to ~/.config/dispatch/config or set DISPATCH_CONFIG.
+# key = value, full-line comments only. No repository paths or workflow hooks.
+# Missing, broken, unknown or duplicate configuration fails closed for approvals.
 
-# Required. The git repo workers branch from (origin must be GitHub), where dispatch keeps
-# workers/ reviews/ archive/, and where each worker writes <evidence_dir>/<NAME>/result.md.
-repo = ~/code/example-project
-state_dir = ~/code/example-notes/dispatch
-evidence_dir = ~/code/example-notes/evidence
-
-# Optional, defaults shown.
-# worktree_root = /private/tmp/dispatch-wt
-# One 10-port block per worker.
-# ports = 3110-3999
-# worker_model = openai/gpt-6.1-sol
-# worker_thinking = high
-
-# Optional brief parts. role_brief is prepended to every task brief (unless the task already
-# contains its first line); review_checklist is handed to the cross-family reviewer.
-# role_brief = ~/code/example-notes/briefs/worker-role.md
-# review_checklist = ~/code/example-notes/briefs/review-checklist.md
-
-# Legacy merge scripts are disabled: stdout events cannot authorize a merge synchronously.
-# A nonempty merge_script makes dispatch merge refuse without launching the script.
-# Update branches separately, re-review the new head/base snapshot, and remove this setting
-# to use `gh pr merge --match-head-commit <reviewed head>` in the configured repo.
-# merge_script = scripts/merge.mjs
-# Base-branch prefixes that keep a merge commit and wait for all checks.
-# merge_commit_bases = stack/
-
-# Optional work-card tracker for `dispatch start --new-card TITLE`. The command must print JSON
-# with `identifier` (and `id`); {title} becomes "NAME · TITLE". card_env adds KEY=VALUE pairs.
-# card_command = example-tracker issue create --title {title} --project EXAMPLE --output json
-# card_env = EXAMPLE_FLAG=1
-# card_log = ~/code/example-notes/cards.txt
-
-# Approval rules for pi confirmations (pi-worker reads this file too).
-# Missing config, unknown keys and incomplete project policy fail closed.
-# Project mode requires this nonempty list. main/master are always added, never replaced.
-# Add ALL shared project branch patterns here (fnmatch, e.g. release/*).
+# main/master are always protected, even if omitted below.
+# Add any other shared branch patterns before enabling approvals.
 protected_branches = main master
-# Optional explicit project-independent mode. It cannot know project shared branches.
+# Explicit opt-in for repositories with no additional shared branches:
 # approval_mode = generic
-# Only recognized simple commands can be approved; compounds/redirects/expansions wait.
-# Canonical temporary roots, never arbitrary string prefixes. Root deletion is refused.
-# Each target and symlink component must stay inside the roots; .tmp itself cannot be a symlink.
-# temp_dirs = /tmp/ /private/tmp/ .tmp/
-# `docker rm` of containers with these name prefixes is auto-approved (none by default).
-# temp_containers = tmp-
-# The one script allowed to run psql with credentials (none by default: such commands wait for a human).
-# db_wrapper = scripts/readonly-psql.sh
 
-# Extra secret-scanner patterns (Python regex), one key per pattern: secret_pattern.<label>.
+# Deletion requires realpath containment and every symlink component must stay
+# within these roots. Never allow deleting a root itself.
+temp_dirs = /tmp/ /private/tmp/ .tmp/
+
+# One ten-port block per worker, reserved across repositories until clean.
+ports = 3110-3999
+
+# Optional extra Python regex patterns. Scanner output never contains matched values.
 # secret_pattern.example-token = \bexample_[A-Za-z0-9]{20,}
-# Loopback test-fixture passwords that are not secrets.
-# secret_fixture_passwords = postgres synthetic
+# Loopback-only test-fixture passwords that are not secrets.
+secret_fixture_passwords = postgres synthetic

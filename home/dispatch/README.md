@@ -1,137 +1,113 @@
-# dispatch
+# Shared Agent development environment
 
-Local scheduling for pi workers, from worktree to independently reviewed PR.
-Each worker runs as an interactive pi session in a Rex pane, under a resident supervisor.
-Needing a human, idling and empty reports emit events without abandoning supervision.
+This directory contains machine-independent Pi supervision, safety rules, credential
+scanning and a lightweight launcher. Run the same checkout on home and work machines.
+No review, merge, pull-request management, issue tracker, database wrapper or project
+hook belongs here. Those workflows live outside this repository.
 
-| Command | What it does |
-|---|---|
-| `dispatch start NAME BRIEF [--common F] [--card ID \| --new-card TITLE] [--base B] [--branch B] [--existing-branch] [--dry-run]` | Creates an isolated checkout, upstream, port block, composed brief and background supervisor. Dry-run runs read-only preflight. |
-| `dispatch status [--json]` | Phase, failure reason, PR, review verdict, card, ports and age. |
-| `dispatch wait [CURSOR]` | Waits for new events; run again after each return. |
-| `dispatch review NAME` or `--pr N --author provider/model --brief F` | Independently reviews the exact head/base snapshot, using another model family. |
-| `dispatch merge PR [--dry-run]` | Requires APPROVE for the current head, base name and base SHA. |
-| `dispatch adopt NAME --out FILE [--model provider/model]` | Supervises an existing pi pane. Without an actual model identity it cannot be automatically reviewed. |
-| `dispatch clean NAME [--force]` | Removes owned checkout/resources and archives state. Fresh branches with an open PR are retained. Resumed remote branches are never deleted. |
-| `dispatch doctor [--compare DIR]` | Checks installation, local drift, config, dependencies and disabled legacy merge scripts. |
+## Setup and commands
 
-`pi-worker` is also usable on its own. It exits 0 after a nonempty report, clean scan and
-`.done` marker, 1 when the pane disappears, or 124 on timeout.
+Copy `dispatch.config.example` to `~/.config/dispatch/config`, or set `DISPATCH_CONFIG`.
+Only safety policy and a port range go in this file. Missing/broken policy, unknown
+keys and duplicates fail closed. Default strict approval mode requires a nonempty
+protected-branch list; `main` and `master` are always added. Explicit `generic` mode
+only knows those built-in branches unless more are listed.
 
-## Safe defaults
+Home Manager links `dispatch` and `pi-worker`; helpers remain beside their real files.
+Before deploying a changed checkout, compare hand-installed copies with doctor.
+Deployment is separate from validation, and doctor never rebuilds or fetches.
 
-Project values live only in `$DISPATCH_CONFIG`, else `~/.config/dispatch/config`.
-Start from [`dispatch.config.example`](dispatch.config.example). Missing config, dangling
-links, unknown/duplicate keys and malformed safety settings never authorize writes.
-Project mode requires a nonempty `protected_branches` declaration. `main` and `master`
-are always protected, even when the project list contains only additional patterns.
-An intentionally project-independent installation can explicitly set `approval_mode = generic`;
-this protects main/master but cannot know a project's other shared branches.
-
-Automatic approval supports only recognized **simple commands**. Compound commands,
-newlines (including ambiguous terminal wraps), redirects, expansions, nested shells,
-Git global options and unknown executables wait for a human. This deliberately also
-rejects `cd ... && git push` and two individually safe commands joined with `;`.
-A bare push is checked against the pane's exported cwd, current branch and upstream.
-Use separate commands rather than weakening this boundary.
-
-Recursive deletion resolves the target and allowed roots, checks canonical directory
-boundaries, and rejects any symlink component escaping the allowed temporary roots,
-even if the final path returns into tmp. `.tmp/` itself cannot be an escaping symlink.
-Deleting an allowed root itself, traversal, globs, broken links and ambiguous cwd wait
-for a human. This is a confirmation-time check, not a filesystem sandbox: do not use
-an automatically approved path when another process can swap its directories or links
-between approval and execution.
-
-## Review and merge contract
-
-The verdict and cache key bind `(head SHA, base branch name, base SHA)`.
-Changing any member, including advancing the base without changing head, requires a
-new review. The snapshot is checked after diff capture, after reviewer completion,
-and immediately before invoking GitHub merge. Legacy head-only verdicts are stale.
-
-The actual provider/model slug determines family (`openai` or `anthropic`), never the
-`pi` or `claude` runner. Unknown models fail closed. A Pi-launched Anthropic model
-cannot serve as an independent reviewer of another Anthropic model. The reviewer
-selection comes from `interrogate reviewers` in `~/.claude/rules/pstack-models.md`.
-For explicit review, pass an actual identity, for example `--author openai/gpt-6.1-sol`,
-not `--author pi`. Local state and model configuration are trusted operator inputs,
-not cryptographically attested identity records.
-
-Legacy `merge_script` execution is **disabled**, not monitored after the fact. Such a
-script can update and merge before a stdout observer can intervene. If configured,
-merge refuses before launching it. Update the branch separately, review the new
-snapshot, and explicitly remove the legacy setting to use the built-in gate.
-No merge-only equivalence exemption is implemented.
-
-The built-in path runs `gh pr merge --match-head-commit <reviewed SHA>` in the configured
-repo, never the caller's cwd. GitHub atomically checks the expected head. GitHub's merge
-API does not offer an equivalent atomic base-name/base-SHA condition: the base check
-is a final client-side preflight, not a server transaction. Do not concurrently retarget
-or advance the base during merge, and use repository branch protections for shared
-branches. A queued/deferred merge is not a new review of a later base.
-
-## Continue an existing PR
+Run from **any Git repository or worktree** with an `origin` remote, including a local
+bare remote. No GitHub account or `gh` dependency is needed.
 
 ```sh
-dispatch start FIX brief.md --branch feature/fix --base origin/main --existing-branch --dry-run
-dispatch start FIX brief.md --branch feature/fix --base origin/main --existing-branch
+dispatch start DEMO brief.md --base origin/main --dry-run
+dispatch start DEMO brief.md --model openai/gpt-6.1-sol
+dispatch status --json
+dispatch wait
+# Continue an existing remote branch; the hosting platform is irrelevant.
+dispatch start NEXT brief.md --branch feature/next --existing-branch --base origin/main
+# Clean only after checking the report. Remote branches are NEVER deleted.
+dispatch clean DEMO
 ```
 
-Default start still refuses an existing remote branch. Explicit continuation accepts
-only an OPEN, non-fork PR on the configured origin, with the requested branch and base.
-It refuses protected branches, existing local branches/worktrees and registered workers,
-fetches the current remote head, creates a new checkout with the matching upstream,
-and records PR/head metadata with the supplied task brief. Carry the original brief
-forward in that file when handing off to another machine. New commits invalidate old
-verdicts. Clean removes only the continuation checkout and local branch, not the remote PR.
-Bare base names and `origin/name` are equivalent. Other remote prefixes and invalid or
-nonexistent bases are refused; arbitrary ref expressions are not supported.
+- `start` creates a local branch/worktree, composes the brief, allocates ten ports,
+  and starts a background supervisor. Fresh remote branches are not created by the
+  launcher; the worker can first push with `git push -u origin HEAD`.
+- `--base` accepts `origin/x` or `x`, not a different remote prefix. `--existing-branch`
+  requires the remote branch to exist and no local same-named branch. Shared branch
+  patterns cannot be used as worker branches. `--common FILE` prepends task context.
+- `--dry-run` does read-only preflight, with no state, worktree, pane or branch writes.
+- `status` shows running, needs-human, stuck, finished, failed and unexpected exits.
+- `wait [CURSOR]` waits for new supervisor events; restart it after each return.
+- `clean` stops a live supervisor only with `--force`, removes owned local resources,
+  archives state and frees ports. Dirty/unmerged work is retained unless forced.
+  Interrupted creation with uncertain ownership is never automatically deleted.
+- `_run` is an internal supervisor entry, not a project integration hook.
 
-Start allocates ports and validates input files before external side effects. It writes
-a `preparing` journal first, records resource ownership as each operation succeeds,
-and leaves `failed` state on later errors. `status` exposes that state and `clean NAME`
-can recover owned resources. If interrupted inside a creation operation, `*_pending`
-flags preserve the uncertainty: clean refuses to guess ownership. Inspect the journal
-and actual refs first, rather than deleting an unverified branch. Keep tracker/card
-IDs from partial failures before retrying, so an external card is not duplicated.
+Default state is `~/.local/state/dispatch/<hash-of-common-git-dir>`; worktrees of the
+same repository share state. Outputs live in `outputs/NAME/result.md` below it.
+Override runtime selection with `DISPATCH_REPO`, `DISPATCH_STATE_DIR`,
+`DISPATCH_EVIDENCE_DIR`, `DISPATCH_WORKTREE_ROOT`, or `DISPATCH_MODEL`. These are
+runtime inputs, not project items in the machine policy. Default worktree root is
+`/private/tmp/dispatch-wt`. A global allocator lock and reservations under that root
+coordinate port allocation across repositories. Alternate roots are independent.
 
-## Public payload checks
+## Supervision and safe confirmation
+
+`pi-worker` runs a visible Pi TUI through Rex. It keeps supervising after a human
+confirmation, idle pane or empty report. It notifies, writes `.needs-human` / `.stuck`
+and appends events, without including the captured command (which may contain secrets).
+A nonempty report and `.done` marker must pass the shared scanner before completion.
+Empty output gets at most three rewrite requests, then waits for human repair.
+Timeout preserves the pane. Model connection retries are bounded. `--attach` can
+supervise an existing pane, but without a verifiable cwd, push confirmations wait.
+
+Automatic push approval reads **local Git configuration, never the network**:
+
+- Only local branch sources and branch destinations are eligible. Tags, bare tag
+  names, `tag`, `refs/tags/`, `--tags`, `--follow-tags`, force/delete/mirror flags,
+  `push.followTags` and remote mirror mode always need a human.
+- Resolve selected remote from explicit arguments, `branch.*.pushRemote`,
+  `remote.pushDefault` and `branch.*.remote`; then inspect `remote.<name>.push`.
+  An explicit bare source still honors its configured destination mapping.
+- With no mapping/refspec, resolve `push.default` (`simple`, `upstream`, `current`)
+  and `branch.<name>.merge`. Matching, nothing, wildcard/multiple ambiguous mappings,
+  detached HEAD, missing cwd, missing source or unresolved targets need a human.
+- All actual destinations must avoid protected patterns. Explicit
+  `HEAD:refs/heads/feature/x` does not inherit a remote's default refspec, but still
+  rejects implicit tag/mirror settings. Unknown syntax never gets guessed.
+
+Deletion approval resolves real paths, checks directory boundaries and checks every
+symlink component. Escaping a temporary root and linking back is refused. A `.tmp`
+root cannot itself be a symlink. Multiple deletion targets must all be safe.
+Compounds are not approximated with a substring match: every segment must be safe,
+and since this parser cannot prove a shell AST, **all compounds, expansions and
+redirections wait for a human**, including apparently safe ones. Database/container
+operations and hosted-PR mutations have no automatic allowlist here.
+
+## Two-machine comparison and tests
 
 ```sh
-python3 home/dispatch/public-check --repo . --base origin/main --pr 1
-# Or check a prepared, not-yet-published PR body:
-python3 home/dispatch/public-check --repo . --base origin/main --pr-body /tmp/pr-body.md
+dispatch doctor --compare /path/to/old/helpers
+dispatch doctor --json > /tmp/dispatch-machine.txt
+# Compare that report with the other machine's report, especially HEAD and file hashes.
+for t in tests/dispatch*.test.sh; do bash "$t"; done
+python3 tests/dotfiles-public-check --base BASE_SHA
 ```
 
-The read-only checker covers the complete diff, commit messages, author **and** committer
-names/emails, and PR body. It requires public GitHub noreply emails, checks local paths
-and hostnames, and runs the shared credential scanner over every payload. Referenced
-commits must already exist locally. A failed or incomplete scan blocks automated review.
-Published historical identity findings are not silently ignored or rewritten; decide
-history governance separately and never claim that a clean incremental scan cleans history.
+Doctor reports the exact checkout SHA, helper SHA-256 fingerprints, dependency paths,
+missing dependencies and hand-installed copy drift. Missing/different installation is
+a WARN before deployment, not proof that this new checkout is installed. FAIL means
+invalid safety policy or a missing runtime dependency. Matching shell comments are
+never accepted as evidence that a helper forwards to the repository.
 
-The scanner's finite built-in formats include OpenAI and Anthropic API keys, GitHub
-tokens, JWTs and password-bearing Postgres URLs. Project-specific patterns belong in
-local `secret_pattern.*` config. It reports locations/categories, never matched values.
-This is not arbitrary secret detection; human review of public material is still required.
-An absent default config permits built-in-only scanning, not write approval; an explicitly
-missing config or broken default link is a scan error.
+The public release check under `tests/` examines only **this dotfiles checkout's**
+diff, commit messages and author/committer identities. It is not part of worker
+startup or collection, and is not a reusable public-PR gate. Existing historical
+metadata is not rewritten. Choose the new-commit base explicitly.
 
-## Setting up another machine
-
-1. Fetch the repository and run `dispatch doctor --compare OLD_SCRIPTS_DIR` before rebuilding.
-2. Back up local copies, inspect every WARN and run the suggested diffs. Doctor only
-   reports proven repository symlinks as forwarding; comments or shell text are not proof.
-   Unknown helpers are reported for classification. No ignore list hides them.
-3. Merge generic local improvements back into the repository; put project values in local config.
-4. Move conflicting hand-installed files aside, keeping backups, then rebuild yourself.
-   Never copy another machine's deletion command to remove your local improvements.
-5. Validate config with doctor and run `dispatch start ... --dry-run`. No FAIL is useful
-   but is not proof that migration is lossless. Inspect WARNs too.
-
-`home.nix` links only `dispatch`, `pi-worker` and `pstack-models.md`; helpers live beside
-the resolved entry point. It does not manage Pi auth or runtime state.
-
-Tests: run each `tests/dispatch*.test.sh`. They use fake Rex, local Git fixtures and
-process-boundary substitutes, never live GitHub merges, real credentials or user-directory deletion.
+The credential scanner covers known vendor formats, private keys, JWTs and credential
+URLs, including nested/binary output; local fixture exceptions only apply on loopback.
+It prints locations/categories, never matched values. Custom regexes are finite checks,
+not proof that arbitrary data is non-secret. Human inspection remains necessary.

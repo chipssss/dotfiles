@@ -1,6 +1,6 @@
 #!/bin/sh
-# Run one pstack worker as an interactive pi session in a Rex pane, the way
-# firstmate launches pi: the full TUI is visible and the brief is the first
+# Run one worker as an interactive pi session in a Rex pane:
+# the full TUI is visible and the brief is the first
 # message. The worker writes its answer to --out and then OUT.done; this script
 # supervises the pane until that marker (or the timeout), closes the pane and
 # prints the out path.

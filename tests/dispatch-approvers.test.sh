@@ -20,8 +20,6 @@ passed = 0
 config = root / 'dispatch.config'
 config.write_text('''protected_branches = main stack/* shared/* release/*
 temp_dirs = /tmp/ /private/tmp/ .tmp/
-temp_containers = tmp-
-db_wrapper = scripts/readonly-psql.sh
 secret_pattern.demo token = \\bdemo_[A-Za-z0-9_-]{20,}
 secret_fixture_passwords = postgres synthetic
 ''')
@@ -64,8 +62,8 @@ try:
         ('双空格相邻仓库 rm', 'rm -rf  ../project', 1),
         ('全部 rm 目标都检查', 'rm -rf /tmp/a ../project', 1),
         ('临时目录穿越', 'rm -rf /private/tmp/../../Users', 1),
-        ('临时容器删除', 'docker rm -fv tmp-task-pg', 0),
-        ('多个临时容器', 'docker rm -fv tmp-task-pg tmp-task-redis', 0),
+        ('容器删除等人工', 'docker rm -fv tmp-task-pg', 1),
+        ('多个容器等人工', 'docker rm -fv tmp-task-pg tmp-task-redis', 1),
         ('postgres-main 容器', 'docker rm -fv postgres-main', 1),
         ('混合容器拒绝', 'docker rm -fv tmp-task-pg postgres-main', 1),
         ('临时容器加目录交人工', 'docker rm -fv tmp-task-pg; rm -rf /tmp/a', 1),
@@ -108,13 +106,13 @@ try:
     for cmd in ['psql "$(op read op://fake/item/url)"', 'psql "$DATABASE_URL"',
                 'psql postgres://fake.invalid/db', 'psql postgresql://fake.invalid/db']:
         p = approve('原始数据库命令硬拒绝', cmd + '; git push origin feature/pitool', 1)
-        check('请改用 scripts/readonly-psql.sh' in p.stdout, '数据库拒绝提示不含原命令')
+        check('数据库命令需要人工确认' in p.stdout, '数据库拒绝提示不含原命令')
     approve('包装脚本加 push 交人工', 'scripts/readonly-psql.sh --file /tmp/query.sql; git push origin feature/pitool', 1)
-    approve('包装脚本在数据库确认中放行', 'scripts/readonly-psql.sh --file /tmp/DATABASE_URL.sql', 0, 'database read')
+    approve('本机脚本不能自动批准', 'scripts/readonly-psql.sh --file /tmp/DATABASE_URL.sql', 1, 'database read')
     approve('包装脚本加嵌套原始 psql 不放行', 'scripts/readonly-psql.sh; bash -c \'psql "$DATABASE_URL"\'; git push origin feature/pitool', 1)
     approve('提及脚本不是调用', 'echo scripts/readonly-psql.sh; psql "$DATABASE_URL"; git push origin feature/pitool', 1)
     approve('包装脚本后混入裸 psql', 'scripts/readonly-psql.sh; psql "$DATABASE_URL"; git push origin feature/pitool', 1)
-    approve('PR 创建', 'gh pr create --body-file /tmp/body', 0, 'GitHub pull-request mutation')
+    approve('PR 创建等人工', 'gh pr create --body-file /tmp/body', 1, 'GitHub pull-request mutation')
     approve('PR 合并', 'gh pr merge 123', 1, 'GitHub pull-request mutation')
     for cmd in ['ps aux', 'ps -ef', '/bin/ps -eo args', 'pgrep -fl node',
                 'pgrep -af node', 'pgrep --full node', 'pgrep -f node',
@@ -225,7 +223,7 @@ elif args[:2]==['block','send']:
             (state/'screen').write_text(ask('git push', 'psql "$DATABASE_URL"; git push origin feature/pitool'))
             waiter.wait(timeout=5); waitlog.flush()
             notified=(state/'waiter').read_text()
-            check('NEEDS HUMAN TEST' in notified and '请改用 scripts/readonly-psql.sh' in notified and 'DONE' not in notified, 'pi-worker 拒绝数据库命令，新事件单独通知后 waiter 退出')
+            check('NEEDS HUMAN TEST' in notified and '数据库命令需要人工确认' in notified and 'DONE' not in notified, 'pi-worker 拒绝数据库命令，新事件单独通知后 waiter 退出')
             check('DATABASE_URL' not in notified+(state/'output').read_text(), 'NEEDS HUMAN 不回显数据库命令')
             (state/'screen').write_text('spinner changed\n' + (state/'screen').read_text())
             time.sleep(.4)
