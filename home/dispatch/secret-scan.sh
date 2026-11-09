@@ -40,16 +40,15 @@ PATTERNS = [
 INVALID_SUFFIX = re.compile(rb'(?:\$\{\{[^\r\n]*?\}\}|[^\s/\?#\'\"])*')
 
 # Do not try to enumerate libpq target overrides. Only this complete shape may
-# be exempt, ending at whitespace, a quote or EOL. Quotes/spaces inside the one
-# port expression are opaque; no other URL component accepts templates.
+# be exempt. A port expression is opaque syntax, never a password exemption.
+# End boundaries are checked separately against the opening quote or line end.
 # Case folding applies only to the scheme and host, not query parameter names.
 SAFE_QUERY_PAIR = rb'(?:sslmode|application_name|connect_timeout)=[A-Za-z0-9_.-]*'
 LOOPBACK_URL = re.compile(
     rb'(?i:[a-z][a-z0-9+.-]*://)[^\s:/@\'\"]*:(?P<pw>[^\s/@\'\"]+)@'
     rb'(?i:localhost|127\.0\.0\.1|\[::1\])'
-    rb'(?::(?:[0-9]+|\$\{\{(?P<expression>(?:(?!\}\})[^\r\n])*)\}\}))?'
-    rb'/[A-Za-z0-9_-]+(?:\?' + SAFE_QUERY_PAIR + rb'(?:&' + SAFE_QUERY_PAIR + rb')*)?'
-    rb'(?=[\s\'\"]|$)')
+    rb'(?::(?:[0-9]+|\$\{\{(?![ \t]*\}\})(?:(?!\}\})[^\r\n])+\}\}))?'
+    rb'/[A-Za-z0-9_-]+(?:\?' + SAFE_QUERY_PAIR + rb'(?:&' + SAFE_QUERY_PAIR + rb')*)?')
 
 def fixture(match):
     host = match.groupdict().get('host')
@@ -59,12 +58,15 @@ def fixture(match):
         suffix = INVALID_SUFFIX.match(match.string, match.end()).group()
         return not (b'@' in match.group('userinfo') or b'@' in suffix or b',' in suffix or b',' in host)
     url = LOOPBACK_URL.match(match.string, match.start())
-    if url is None:
+    if url is None or url.group('pw') not in fixture_passwords:
         return False
-    expression = url.group('expression')
-    if expression is not None:
-        return bool(expression.strip())
-    return url.group('pw') in fixture_passwords
+    tail = match.string[url.end():]
+    quote = match.string[max(0, match.start() - 1):match.start()]
+    if quote in (b"'", b'"'):
+        # YAML/JSON/shell values must close with the same opening quote.
+        return re.match(re.escape(quote) + rb'(?=[ \t,}\]]|$)', tail) is not None
+    # Plain scalars may only end the line, optionally with a spaced # comment.
+    return re.fullmatch(rb'(?:[ \t]*|[ \t]+#.*)', tail) is not None
 
 def scan_error(path):
     global errors

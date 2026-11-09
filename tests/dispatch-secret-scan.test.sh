@@ -18,13 +18,13 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
     config.write_text('')
     env = dict(os.environ, DISPATCH_CONFIG=str(config))
     artifact = root / 'artifact'
-    # Synthetic service-container URL with a redacted password and CI port expression.
-    artifact.write_text("TEST_DATABASE_URL: postgresql://postgres:<pw>@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/app_test" + '\n')
+    # Synthetic service-container URL with a default fixture password.
+    artifact.write_text('TEST_DATABASE_URL: postgresql://' + "postgres:synthetic@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/app_test\n")
     scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
     assert scan.returncode == 0 and not scan.stdout and not scan.stderr, 'CI loopback URL must not be reported as a credential'
-    print('PASS: redacted CI loopback URL is clean', flush=True)
+    print('PASS: allowlisted CI loopback URL is clean', flush=True)
 
-    # Replay all three review rounds through the public CLI. Expectations come
+    # Replay all review rounds through the public CLI. Expectations come
     # from the whole-URL contract, not from the scanner's matching expressions.
     corpus = json.loads((Path(os.environ['ROOT']) / 'tests/dispatch-secret-scan-review.json').read_text())
     failures = []
@@ -85,13 +85,13 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
     check_url('localhost', ci_port, 1, user='user@name')
     check_url('localhost', ci_port, 1, password='synthetic@part')
 
-    # Exact loopbacks need a fixture password OR a complete CI port expression.
+    # All ports require a fixture password, including complete CI expressions.
     ports = ['', ':5432', ":${{ job.services.postgres.ports['5432'] }}"]
     loopbacks = ['127.0.0.1', '[::1]', 'localhost', 'LOCALHOST']
     for host in loopbacks:
         for port in ports:
             for user in ['postgres', '']:
-                check_url(host, port, 0 if port == ports[2] else 1, user=user)
+                check_url(host, port, 1, user=user)
                 check_url(host, port, 0, user=user, password='synthetic')
 
     # Only literal safe query names and simple values are exempt. Everything
@@ -113,6 +113,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
         '?SSLMODE=disable', '?application%5Fname=ci', '?sslmode=%64isable',
         '?sslmode=disable&', '?sslmode=disable&&connect_timeout=1',
         '?sslmode', '?', '?application_name=a/b', '?application_name=${{ env.NAME }}',
+        '?schema=public', '?charset=utf8mb4', '?TimeZone=UTC', '?authSource=admin',
     ]
     harmless_queries = [
         '?sslmode=disable', '?application_name=hostx', '?connect_timeout=10',
@@ -122,7 +123,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
     ]
     for host in loopbacks:
         for port, password in [('', 'synthetic'), (':5432', 'postgres'),
-                               (ports[2], '<pw>'), (ports[2], 'synthetic')]:
+                               (ports[2], 'postgres'), (ports[2], 'synthetic')]:
             for query in target_queries:
                 check_url(host, port, 1, password=password, query=query)
             for query in harmless_queries:
@@ -130,7 +131,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
 
     # DB names and URL terminators are part of the whitelist. Bare ::1 is
     # deliberately rejected; bracketed IPv6 is the only IPv6 fixture shape.
-    for port, password in [('', 'synthetic'), (':5432', 'postgres'), (ports[2], '<pw>')]:
+    for port, password in [('', 'synthetic'), (':5432', 'postgres'), (ports[2], 'synthetic')]:
         for dbname in ['', '.', 'app.test', 'app%5Ftest', 'app/test', '${{ env.DB_NAME }}']:
             check_url('localhost', port, 1, password=password, dbname=dbname)
         check_url('LOCALHOST', port, 0, password=password, dbname='DB-1_2')
@@ -141,26 +142,57 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
     for port in [':', ':abc', ':12x', ':${{ ports.db }}${{ ports.other }}',
                  ':${{ ports.db }}evil', ':${{ }}', ':${{ a}}b }}']:
         check_url('localhost', port, 1, password='synthetic')
-    check_url('127.0.0.1', ports[2], 0, query='?sslmode=disable')
+    check_url('127.0.0.1', ports[2], 0, password='synthetic', query='?sslmode=disable')
     check_url('localhost', ':0005432', 0, password='synthetic')
 
-    # A following URL's query cannot revoke the first URL's exemption.
+    # Quote/line boundaries are checked even with an allowlisted password.
+    # Unquoted whitespace or quotes cannot hide a later target override.
     later_target = 'postgresql://' + 'db.example.com/app_test?host=db.prod.example.com'
-    for port, password in [(':5432', 'synthetic'), (ports[2], '<pw>')]:
-        first_url = 'postgresql://' + f'app_test:{password}@localhost{port}/app_test?sslmode=disable'
-        for separator in [' ', '\t', '"', "'"]:
-            artifact.write_text(first_url + separator + later_target + '\n')
-            scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
-            assert scan.returncode == 0 and not scan.stdout and not scan.stderr, 'queries belong only to their own URL'
-            passed += 1
+    for port in [':5432', ports[2]]:
+        for query in ['', '?sslmode=disable']:
+            url = 'postgresql://' + f'app_test:synthetic@localhost{port}/app_test{query}'
+            boundaries = [(url + tail, expected) for tail, expected in [
+                ('', 0), ('  \t', 0), (' # fixture comment', 0), ('\t# comment', 0),
+                ('#comment', 1), (' #comment\n', 0),
+                (' ?host=db.example.com', 1), ('\t?host=db.example.com', 1),
+                ("'?host=db.example.com", 1), ('"?host=db.example.com', 1),
+                (' ?sslmode=disable&host=db.example.com', 1),
+                (' ' + later_target, 1), (',', 1), (';', 1), ('}', 1),
+            ]]
+            for quote in ["'", '"']:
+                other = '"' if quote == "'" else "'"
+                boundaries.extend([
+                    ('TEST_DATABASE_URL: ' + quote + url + quote, 0),
+                    ('TEST_DATABASE_URL: ' + quote + url + other, 1),
+                    ('TEST_DATABASE_URL: ' + quote + url, 1),
+                    ('TEST_DATABASE_URL: ' + quote + url + ' ?host=db.example.com' + quote, 1),
+                    ('TEST_DATABASE_URL: ' + quote + url + quote + ' # comment', 0),
+                    ('TEST_DATABASE_URL: ' + quote + url + quote + ',}', 0),
+                    ('TEST_DATABASE_URL: ' + quote + url + quote + ']', 0),
+                    ('TEST_DATABASE_URL: ' + quote + url + quote + '?host=db.example.com', 1),
+                    (quote + url + quote + ' ' + later_target, 0),
+                ])
+            boundaries.extend([
+                (json.dumps({'url': url}), 0),
+                ('`' + url + '`', 1), ('[fixture](' + url + ')', 1),
+                ('<' + url + '>', 1),
+                ('redis://' + ':synthetic@localhost:6379', 1),
+                ('postgresql://' + 'app:synthetic@localhost:5432', 1),
+            ])
+            for content, expected in boundaries:
+                artifact.write_text(content + '\n')
+                scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
+                assert scan.returncode == expected, f'URL boundary: expected {expected}, got {scan.returncode}'
+                assert not scan.stderr
+                assert scan.stdout == (f'{artifact}:1: 带密码的 URL\n' if expected else '')
+                passed += 1
 
-    # Expressions outside the port, incomplete expressions and trailing port text
-    # are not service-container ports. Numeric tunnel passwords must still report.
-    for port in [':15432', '/${{ ports.db }}', ':5432/${{ ports.db }}',
+    # Keep the whole-URL port shape restriction, not a template-based exemption.
+    for port in ['/${{ ports.db }}', ':5432/${{ ports.db }}',
                  ':${{ ports.db', ':${{ }}', ':${{ ports.db }}evil',
                  ':${{ ports.db }}:5432', ':prefix${{ ports.db }}',
                  ':${{ ports.db }}evil${{ ports.other }}']:
-        check_url('127.0.0.1', port, 1)
+        check_url('127.0.0.1', port, 1, password='synthetic')
 
     # A loopback-looking prefix or substring is never a loopback host exemption.
     for host in ['127.0.0.1.evil.com', 'localhost.example', '[::1].evil.com',
@@ -191,14 +223,17 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
     config.write_text('secret_fixture_passwords = demo-fixture\n')
     check_url('localhost', ':5432', 0, password='demo-fixture')
     check_url('localhost', ':5432', 1, password='synthetic')
-    check_url('localhost', ports[2], 0)
+    check_url('localhost', ports[2], 0, password='demo-fixture')
+    check_url('localhost', ports[2], 1, password='synthetic')
+    check_url('localhost', ports[2], 1)
     config.write_text('secret_fixture_passwords =\n')
     check_url('localhost', ':5432', 1, password='synthetic')
-    check_url('localhost', ports[2], 0)
+    check_url('localhost', ports[2], 1, password='synthetic')
+    check_url('localhost', ports[2], 1)
 
     # Loopback exemptions apply only to password URLs, not custom secret formats.
-    config.write_text('secret_pattern.redacted-test = <pw>\n')
-    artifact.write_text('redis://' + ':<pw>@localhost:${{ ports.cache }}/0\n')
+    config.write_text('secret_pattern.redacted-test = synthetic\n')
+    artifact.write_text('redis://' + ':synthetic@localhost:${{ ports.cache }}/0\n')
     scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
     assert scan.returncode == 1 and scan.stdout == f'{artifact}:1: redacted-test\n' and not scan.stderr
     passed += 1

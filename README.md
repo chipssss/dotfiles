@@ -186,6 +186,20 @@ Home Manager deliberately does not manage `~/.pi/agent` itself, or Pi authentica
 
 ## Notes
 
+The shared credential scanner exempts a loopback password URL only when its
+password is in `secret_fixture_passwords` **and** the entire URL follows the
+[documented fixture shape](home/dispatch/README.md). A CI template port does not
+exempt arbitrary passwords. Add a CI container's one-time password only to local
+`~/.config/dispatch/config` or a private config selected by `DISPATCH_CONFIG`, never
+this public repository. For example, replace the local key with
+`secret_fixture_passwords = postgres synthetic <one-time-ci-password>`; this
+replaces the defaults, and an empty list disables every loopback exemption.
+Unquoted URLs may end only at line end or a spaced ` #` comment; quoted YAML/JSON
+values must close with the same quote. Common reported shapes include missing DB
+names (`redis://` + `:pw@localhost:6379`), trailing `/`, `?schema=public`, dotted DB
+names, other query parameters, Markdown backticks/links, and unquoted trailing
+`,`, `;`, `}`. See the linked contract before changing fixture text.
+
 The first time you launch `nvim`, it bootstraps [lazy.nvim](https://github.com/folke/lazy.nvim) by cloning plugins from GitHub.
 That needs network access once; after that it's offline.
 Neovim and WezTerm both use the rose-pine moon theme.

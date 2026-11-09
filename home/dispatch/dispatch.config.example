@@ -18,16 +18,27 @@ ports = 3110-3999
 # Optional extra Python regex patterns. Scanner output never contains matched values.
 # secret_pattern.example-token = \bexample_[A-Za-z0-9]{20,}
 # Password whitelist (default below). A loopback exemption first requires:
-# <scheme>://user:password@HOST[:PORT]/DBNAME[?QUERY], then whitespace, a quote or EOL.
+# <scheme>://user:password@HOST[:PORT]/DBNAME[?QUERY].
+# Unquoted: only EOL, trailing spaces/tabs or a spaced # comment may follow.
+# Quoted: the same opening single/double quote must close the URL, followed by
+# whitespace, EOL or , } ]. Stray whitespace/quotes cannot hide a query suffix.
 # HOST: exactly localhost, 127.0.0.1 or [::1], case-insensitive; bare ::1 is flagged.
 # PORT: digits or one complete, nonempty ${{ ... }} expression, no internal }}.
 # DBNAME: required, [A-Za-z0-9_-]+ only; no templates, percent escapes or slashes.
 # QUERY: name=value pairs joined by &, names literally sslmode, application_name
 # or connect_timeout (lowercase), values [A-Za-z0-9_.-]* only (possibly empty).
 # Other names, %, #, extra @, multi-host lists and non-boundary suffixes are flagged.
-# The password must ALSO be in this list, OR the port must be the CI expression.
-# Numeric-port SSH tunnels with other passwords are flagged. An empty list only
-# disables password-based exemptions. Changes affect doctor's config fingerprint.
+# The password must ALSO be in this list. A template port never exempts arbitrary
+# passwords. An empty list disables ALL loopback exemptions, including CI.
+# For a CI one-time password, edit ~/.config/dispatch/config or a private config
+# selected with DISPATCH_CONFIG. Replace the key locally, keeping defaults if needed:
+# secret_fixture_passwords = postgres synthetic <one-time-ci-password>
+# Never put CI one-time passwords or real/reusable credentials in this public repo.
+# Numeric-port SSH tunnels with other passwords are flagged.
+# Changes affect doctor's config fingerprint.
+# Common reported shapes, even with a listed password: no DBNAME (redis:// plus
+# :pw@localhost:6379), trailing /, ?schema=public, dotted DBNAME, other query names
+# (charset, TimeZone, authSource), Markdown backticks/links, unquoted trailing , ; }.
 # The existing reserved .invalid fixture exemption is unchanged.
 # See README.md for the full URL contract and CI service-container example.
 secret_fixture_passwords = postgres synthetic
