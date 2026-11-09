@@ -62,7 +62,7 @@ def configure():
     ROOT = Path(os.environ.get('DISPATCH_STATE_DIR', str(Path.home() / '.local/state/dispatch' / key))).expanduser().resolve()
     EVIDENCE = Path(os.environ.get('DISPATCH_EVIDENCE_DIR', str(ROOT / 'outputs'))).expanduser().resolve()
     WT_ROOT = Path(os.environ.get('DISPATCH_WORKTREE_ROOT', '/private/tmp/dispatch-wt')).expanduser().resolve()
-    first, last = map(int, CONF.get('ports', '3110-3999').split('-'))
+    first, last = map(int, CONF['ports'].split('-'))
     PORTS = range(first, last - 8, 10)
     os.environ['DISPATCH_CONFIG'] = str(dispatchconf.path().resolve())
 
@@ -133,7 +133,7 @@ def allocate_ports():
 
 
 def protected_branch(branch):
-    return any(fnmatch.fnmatchcase(branch, p) for p in ['main', 'master', *dispatchconf.words(CONF, 'protected_branches')])
+    return any(fnmatch.fnmatchcase(branch, p) for p in dispatchconf.protected_branches(CONF))
 
 
 def normalize_base(base):
@@ -375,12 +375,10 @@ def cmd_doctor(a):
         conf = dispatchconf.load()
         dispatchconf.approval_policy(conf)
         # Hash effective policy, not its path, comments or presentation whitespace.
-        effective = dict(ports='3110-3999', approval_mode='strict', protected_branches='',
-                         temp_dirs='/tmp/ /private/tmp/ .tmp/', secret_fixture_passwords='postgres synthetic')
-        effective.update(conf)
-        for key in ('protected_branches', 'temp_dirs', 'secret_fixture_passwords'):
+        effective = dict(conf)
+        for key in ('temp_dirs', 'secret_fixture_passwords'):
             effective[key] = sorted(set(dispatchconf.words(effective, key)))
-        effective['protected_branches'] = sorted(set(['main', 'master', *effective['protected_branches']]))
+        effective['protected_branches'] = sorted(set(dispatchconf.protected_branches(conf)))
         config_sha256 = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()
     except (OSError, ValueError):
         doc.say('FAIL', 'config', '配置缺失、无效或策略不完整')

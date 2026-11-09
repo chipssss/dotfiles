@@ -270,8 +270,10 @@ elif args[:2]==['block','send']:
         ('private-key-rsa', '-----BEGIN ' + 'RSA PRIVATE KEY-----'),
         ('private-key-pkcs8', '-----BEGIN ' + 'PRIVATE KEY-----'),
         ('private-key-encrypted', '-----BEGIN ' + 'ENCRYPTED PRIVATE KEY-----'),
+        ('private-key-pgp', '-----BEGIN ' + 'PGP PRIVATE KEY BLOCK-----'),
         ('github-token', 'ghp_' + 'syntheticNotReal' * 3),
         ('config-pattern', 'demo_' + 'synthetic-not-real' * 2),
+        ('redis-password-only', 'redis://' + ':not-a-real-password@cache.example.com:6379/0'),
         ('redis-url', 'redis://' + 'fixture:not-a-real-password@localhost/test'),
         ('mysql-url', 'mysql://' + 'fixture:not-a-real-password@127.0.0.1/test'),
         ('generic-url', 'demo+tcp://' + 'fixture:not-a-real-password@[::1]/test'),
@@ -306,7 +308,9 @@ elif args[:2]==['block','send']:
         'postgres://fixture:synthetic@localhost/test\npostgres://fixture:anything@host.invalid/db\n'
         'redis://fixture:synthetic@127.0.0.1/test\nmysql://fixture:synthetic@[::1]/test\n'
         'https://fixture:anything@host.invalid/test\nredis://localhost/test\n'
-        'https://user@example.com/path\nnot-a-private-key\n')
+        'https://user@example.com/path\nnot-a-private-key\n'
+        'redis://:synthetic@localhost/0\nredis://:anything@host.invalid/0\n'
+        'redis://:@cache.example.com/0\n')
     for args, expected in [([str(out.parent)], 0), ([], 2), ([str(out.parent/'missing')], 2)]:
         scan=subprocess.run(['sh', str(scripts/'secret-scan.sh'), *args], capture_output=True, text=True)
         check(scan.returncode==expected, '共用扫描器干净/用法/缺文件退出码 '+str(expected))

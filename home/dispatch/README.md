@@ -11,7 +11,10 @@ Copy `dispatch.config.example` to `~/.config/dispatch/config`, or set `DISPATCH_
 Only safety policy and a port range go in this file. Missing/broken policy, unknown
 keys and duplicates fail closed. Default strict approval mode requires a nonempty
 protected-branch list; `main` and `master` are always added. Explicit `generic` mode
-only knows those built-in branches unless more are listed.
+only knows those built-in branches unless more are listed. `dispatchconf.py` owns
+all setting defaults and built-in protected branches; launcher, approval, scanner
+and doctor use the same effective settings. Explicit empty values do not restore
+defaults (and an empty protected list still fails in strict mode).
 
 Home Manager links `dispatch` and `pi-worker`; helpers remain beside their real files.
 Before deploying a changed checkout, compare hand-installed copies with doctor.
@@ -126,8 +129,10 @@ startup or collection, and is not a reusable public-PR gate. Existing historical
 metadata is not rewritten. Choose the new-commit base explicitly.
 
 The credential scanner checks OpenAI/Anthropic API key shapes, GitHub tokens,
-`BEGIN ... PRIVATE KEY` headers, three-part JWT-shaped strings, and generic
-`scheme://user:password@host.invalid/path`-shaped URLs, including nested/binary output. Password URLs
+`BEGIN ... PRIVATE KEY` headers (including `BEGIN PGP PRIVATE KEY BLOCK`),
+three-part JWT-shaped strings, and generic
+`scheme://user:password@host.invalid/path`-shaped URLs, including empty usernames
+such as `redis://:password@host.invalid/0` and nested/binary output. Password URLs
 on reserved `.invalid` hosts are fixtures; on loopback (`localhost`, `127.0.0.1`,
 `[::1]`) only configured fixture passwords are exempt. Other loopback passwords
 are still flagged. URLs without a password are not flagged by this rule.

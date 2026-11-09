@@ -21,16 +21,16 @@ except (OSError, ValueError, re.error) as e:
     sys.exit(2)
 
 PATTERNS = [
-    ('私钥', re.compile(rb'-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----')),
+    ('私钥', re.compile(rb'-----BEGIN (?:[A-Z]+ )*PRIVATE KEY(?: BLOCK)?-----')),
     ('OpenAI API key', re.compile(rb'\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}')),
     ('Anthropic API key', re.compile(rb'\bsk-ant-(?:api\d+-)?[A-Za-z0-9_-]{32,}')),
-    ('带密码的 URL', re.compile(rb'\b[a-z][a-z0-9+.-]*://[^\s:@/\'"]+:(?P<pw>[^\s@/\'"]+)@(?P<host>\[[^\]]+\]|[^\s:/?#@\'"]+)', re.IGNORECASE)),
+    ('带密码的 URL', re.compile(rb'\b[a-z][a-z0-9+.-]*://[^\s:@/\'"]*:(?P<pw>[^\s@/\'"]+)@(?P<host>\[[^\]]+\]|[^\s:/?#@\'"]+)', re.IGNORECASE)),
     ('JWT', re.compile(rb'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])')),
     ('GitHub 令牌', re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})')),
 ] + extra
 
 # Test fixtures on loopback or reserved hosts are not credentials.
-FIXTURE_PASSWORDS = {w.encode() for w in dispatchconf.words(conf, 'secret_fixture_passwords', 'postgres synthetic')}
+FIXTURE_PASSWORDS = {w.encode() for w in dispatchconf.words(conf, 'secret_fixture_passwords')}
 
 def fixture(match):
     host = match.groupdict().get('host')

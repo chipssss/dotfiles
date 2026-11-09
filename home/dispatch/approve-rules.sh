@@ -36,7 +36,7 @@ try:
     dispatchconf.approval_policy(conf)
 except (OSError, ValueError):
     deny('dispatch 配置缺失或策略不完整，需要人工确认')
-PROTECTED = ['main', 'master', *dispatchconf.words(conf, 'protected_branches')]
+PROTECTED = dispatchconf.protected_branches(conf)
 match = re.search(r'Allow ([^?]+)\?', text)
 if not match:
     deny('无法识别确认类型')
@@ -96,6 +96,8 @@ def one(key, default=''):
 
 
 def branch_ref(ref, source=False):
+    if ref.startswith('refs/tags/'):
+        deny('推送标签需要人工确认')
     # A short destination can resolve to a remote-only tag or symbolic HEAD.
     # Without contacting the remote, only a fully qualified branch is provable.
     if not source and not ref.startswith('refs/heads/'):
@@ -111,7 +113,7 @@ def branch_ref(ref, source=False):
     if not ref.startswith('refs/heads/'):
         p = subprocess.run(['git', '-C', cwd, 'show-ref', '--verify', '--quiet', 'refs/tags/' + name], capture_output=True)
         if p.returncode != 1:
-            deny('标签或同名歧义引用需要人工确认')
+            deny('推送标签或同名歧义引用需要人工确认')
     if source:
         git('show-ref', '--verify', 'refs/heads/' + name)
     if protected(name):
@@ -123,6 +125,8 @@ def authorize_push(push_args):
     global head
     if not cwd or not os.path.isabs(cwd):
         deny('git push 缺少可验证的工作目录')
+    if 'tag' in push_args[1:] or any(a in ('--tags', '--follow-tags') for a in push_args):
+        deny('推送标签需要人工确认')
     if any(a.startswith(('--force', '+', ':')) or
            (a.startswith('-') and a not in ('-u', '--set-upstream')) for a in push_args):
         deny('git push 包含标签、强推、删除或不支持的选项')
@@ -133,8 +137,10 @@ def authorize_push(push_args):
                                             one(f'branch.{head}.remote') or 'origin')
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', remote) or remote not in git('remote').splitlines():
         deny('remote 无法验证')
-    if one('push.followTags', 'false').lower() not in ('false', 'no', 'off', '0') or one(f'remote.{remote}.mirror', 'false').lower() not in ('false', 'no', 'off', '0'):
-        deny('隐式标签或镜像推送需要人工确认')
+    if one('push.followTags', 'false').lower() not in ('false', 'no', 'off', '0'):
+        deny('隐式推送标签需要人工确认')
+    if one(f'remote.{remote}.mirror', 'false').lower() not in ('false', 'no', 'off', '0'):
+        deny('镜像推送需要人工确认')
     mappings = config(f'remote.{remote}.push')
     refs = push_args[1:]
     if not refs:
@@ -200,7 +206,7 @@ def temporary(target):
     if '..' in raw.parts:
         return False
     roots = []
-    for root in dispatchconf.words(conf, 'temp_dirs', '/tmp/ /private/tmp/ .tmp/'):
+    for root in dispatchconf.words(conf, 'temp_dirs'):
         p = Path(root)
         if not p.is_absolute():
             if not cwd or root != '.tmp/':
