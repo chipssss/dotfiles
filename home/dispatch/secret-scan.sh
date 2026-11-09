@@ -15,31 +15,58 @@ import dispatchconf
 
 try:
     conf = dispatchconf.load(allow_missing=True)
+    fixture_passwords = {pw.encode() for pw in dispatchconf.words(conf, 'secret_fixture_passwords')}
     extra = [(k.split('.', 1)[1], re.compile(v.encode())) for k, v in conf.items() if k.startswith('secret_pattern.')]
 except (OSError, ValueError, re.error) as e:
     print(f'{dispatchconf.path()}:0: 配置无法读取（{type(e).__name__}）')
     sys.exit(2)
 
 PATTERNS = [
-    ('私钥', re.compile(rb'-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----')),
+    ('私钥', re.compile(rb'-----BEGIN (?:[A-Z]+ )*PRIVATE KEY(?: BLOCK)?-----')),
     ('OpenAI API key', re.compile(rb'\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}')),
     ('Anthropic API key', re.compile(rb'\bsk-ant-(?:api\d+-)?[A-Za-z0-9_-]{32,}')),
-    ('带密码的 URL', re.compile(rb'\b[a-z][a-z0-9+.-]*://[^\s:@/\'"]+:(?P<pw>[^\s@/\'"]+)@(?P<host>\[[^\]]+\]|[^\s:/?#@\'"]+)', re.IGNORECASE)),
+    ('带密码的 URL', re.compile(
+        rb'\b[a-z][a-z0-9+.-]*://(?P<userinfo>[^\s:/\'"]*:(?P<pw>[^\s/\'"]+))@'
+        # Keep bracketed-host suffixes so [::1].evil.com is not exempt.
+        # Recognize bare ::1 only at a host boundary; leave port templates opaque.
+        rb'(?P<host>\[[^\]]+\][^\s:/?#@\'"]*|::1(?=[:/?#\s\'"]|$)|'
+        rb'[^\s:/?#@\'"]+|[^\s/?#@\'"]+)', re.IGNORECASE)),
     ('JWT', re.compile(rb'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])')),
     ('GitHub 令牌', re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})')),
 ] + extra
 
-# Test fixtures on loopback or reserved hosts are not credentials.
-FIXTURE_PASSWORDS = {w.encode() for w in dispatchconf.words(conf, 'secret_fixture_passwords', 'postgres synthetic')}
+# This legacy .invalid exemption is intentionally unchanged. Its authority
+# check is not used for loopbacks; those must match the entire safe URL shape.
+INVALID_SUFFIX = re.compile(rb'(?:\$\{\{[^\r\n]*?\}\}|[^\s/\?#\'\"])*')
+
+# Do not try to enumerate libpq target overrides. Only this complete shape may
+# be exempt. A port expression is opaque syntax, never a password exemption.
+# End boundaries are checked separately against the opening quote or line end.
+# Case folding applies only to the scheme and host, not query parameter names.
+SAFE_QUERY_PAIR = rb'(?:sslmode|application_name|connect_timeout)=[A-Za-z0-9_.-]*'
+LOOPBACK_URL = re.compile(
+    rb'(?i:[a-z][a-z0-9+.-]*://)[^\s:/@\'\"]*:(?P<pw>[^\s/@\'\"]+)@'
+    rb'(?i:localhost|127\.0\.0\.1|\[::1\])'
+    rb'(?::(?:[0-9]+|\$\{\{(?![ \t]*\}\})(?:(?!\}\})[^\r\n])+\}\}))?'
+    rb'/[A-Za-z0-9_-]+(?:\?' + SAFE_QUERY_PAIR + rb'(?:&' + SAFE_QUERY_PAIR + rb')*)?')
 
 def fixture(match):
     host = match.groupdict().get('host')
     if host is None:
         return False
-    host = host.lower()
-    if host.endswith(b'.invalid'):
-        return True
-    return host in (b'localhost', b'127.0.0.1', b'[::1]') and match['pw'] in FIXTURE_PASSWORDS
+    if host.lower().endswith(b'.invalid'):
+        suffix = INVALID_SUFFIX.match(match.string, match.end()).group()
+        return not (b'@' in match.group('userinfo') or b'@' in suffix or b',' in suffix or b',' in host)
+    url = LOOPBACK_URL.match(match.string, match.start())
+    if url is None or url.group('pw') not in fixture_passwords:
+        return False
+    tail = match.string[url.end():]
+    quote = match.string[max(0, match.start() - 1):match.start()]
+    if quote in (b"'", b'"'):
+        # YAML/JSON/shell values must close with the same opening quote.
+        return re.match(re.escape(quote) + rb'(?=[ \t,}\]]|$)', tail) is not None
+    # Plain scalars may only end the line, optionally with a spaced # comment.
+    return re.fullmatch(rb'(?:[ \t]*|[ \t]+#.*)', tail) is not None
 
 def scan_error(path):
     global errors

@@ -187,6 +187,9 @@ elif args[:2]==['block','send']:
             check(wait_for(lambda: (state / 'calls').exists()), label + ' 启动')
             (state / 'screen').write_text(ask('git push', command))
             check(wait_for(lambda: 'NEEDS HUMAN' in events()) and keys() == '', label + ' 不按回车')
+            if label == 'tag-keyword':
+                reason = Path(str(out) + '.needs-human').read_text()
+                check('推送标签' in reason and command not in reason + events(), '推标签通知说明动作且不回显命令')
             (state / 'screen').write_text('─\n─')
             finish(proc, state, out, events, log, label)
         finally:

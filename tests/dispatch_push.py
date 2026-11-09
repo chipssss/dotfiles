@@ -32,10 +32,13 @@ class PushRules(unittest.TestCase):
         return subprocess.check_output(['git', '-C', str(self.repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
 
     def safe(self, command):
+        return self.approve(command).returncode
+
+    def approve(self, command):
         text = 'Confirm external or irreversible action\nAllow git push?\n\n' + command + '\n↑↓ navigate • enter select\n'
         env = dict(os.environ, PI_SCRIPTS=str(SCRIPTS), PI_APPROVE_CWD=str(self.repo), DISPATCH_CONFIG=str(self.config))
-        return subprocess.run(['sh', '-c', '. "$PI_SCRIPTS/approve-rules.sh"; safe_ask "$1"', 'test', text],
-                              env=env, capture_output=True).returncode
+        return subprocess.run(['sh', '-c', '. "$PI_SCRIPTS/approve-rules.sh"; safe_ask "$1"; r=$?; printf "%s" "$APPROVAL_REASON"; exit "$r"', 'test', text],
+                              env=env, capture_output=True, text=True)
 
     def test_tags_always_manual(self):
         for args in ['origin tag v9', 'origin v9', 'origin refs/tags/v9', 'origin HEAD:refs/tags/v9',
@@ -43,6 +46,17 @@ class PushRules(unittest.TestCase):
                      'origin HEAD:HEAD', 'origin HEAD:remote-only-tag']:
             with self.subTest(args=args):
                 self.assertEqual(self.safe('git push ' + args), 1)
+
+    def test_tag_reason_names_the_action_without_echoing_command(self):
+        for args in ['origin tag v9', 'origin v9', 'origin refs/tags/v9',
+                     'origin HEAD:refs/tags/v9', '--tags', '--follow-tags']:
+            with self.subTest(args=args):
+                result = self.approve('git push ' + args)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('推送标签', result.stdout)
+                self.assertNotIn(args, result.stdout + result.stderr)
+        self.git('config', 'push.followTags', 'true')
+        self.assertIn('推送标签', self.approve('git push origin feature/demo').stdout)
 
     def test_configured_refspec_cannot_redirect_to_main(self):
         self.git('config', 'remote.origin.push', 'refs/heads/feature/demo:refs/heads/main')

@@ -270,16 +270,18 @@ elif args[:2]==['block','send']:
         ('private-key-rsa', '-----BEGIN ' + 'RSA PRIVATE KEY-----'),
         ('private-key-pkcs8', '-----BEGIN ' + 'PRIVATE KEY-----'),
         ('private-key-encrypted', '-----BEGIN ' + 'ENCRYPTED PRIVATE KEY-----'),
+        ('private-key-pgp', '-----BEGIN ' + 'PGP PRIVATE KEY BLOCK-----'),
         ('github-token', 'ghp_' + 'syntheticNotReal' * 3),
         ('config-pattern', 'demo_' + 'synthetic-not-real' * 2),
-        ('redis-url', 'redis://' + 'fixture:not-a-real-password@localhost/test'),
-        ('mysql-url', 'mysql://' + 'fixture:not-a-real-password@127.0.0.1/test'),
-        ('generic-url', 'demo+tcp://' + 'fixture:not-a-real-password@[::1]/test'),
+        ('redis-password-only', 'redis://' + ':not-a-real-password@cache.example.com:6379/0'),
+        ('redis-url', 'redis://' + 'fixture:not-a-real-password@localhost.example/test'),
+        ('mysql-url', 'mysql://' + 'fixture:not-a-real-password@127.0.0.1.evil.com/test'),
+        ('generic-url', 'demo+tcp://' + 'fixture:not-a-real-password@[2001:db8::1]/test'),
         ('uppercase-url', 'HTTPS://' + 'fixture:not-a-real-password@example.com/test'),
         ('url-query', 'https://' + 'fixture:not-a-real-password@example.com?fixture.invalid'),
         ('url-fragment', 'https://' + 'fixture:not-a-real-password@example.com#fixture.invalid'),
-        ('database-url', 'postgres://' + 'fixture:not-a-real-password@localhost/test'),
-        ('database-url-long', 'postgresql://' + 'fixture:not-a-real-password@localhost/test'),
+        ('database-url', 'postgres://' + 'fixture:not-a-real-password@db.example.com/test'),
+        ('database-url-long', 'postgresql://' + 'fixture:not-a-real-password@db.example.com/test'),
         ('jwt', 'eyJhbGciOiJIUzI1NiJ9' + '.eyJzdWIiOiJmaXh0dXJlIn0' + '.c3ludGhldGljLXNpZ25hdHVyZQ'),
         ('jwt-whitespace', 'eyAiYWxnIjogIkhTMjU2IiB9' + '.eyAic3ViIjogImZpeHR1cmUiIH0' + '.c3ludGhldGljLXNpZ25hdHVyZQ'),
     ]:
@@ -310,6 +312,14 @@ elif args[:2]==['block','send']:
     for args, expected in [([str(out.parent)], 0), ([], 2), ([str(out.parent/'missing')], 2)]:
         scan=subprocess.run(['sh', str(scripts/'secret-scan.sh'), *args], capture_output=True, text=True)
         check(scan.returncode==expected, '共用扫描器干净/用法/缺文件退出码 '+str(expected))
+    # Build synthetic fixtures without embedding credential-shaped source lines.
+    (out.parent/'empty-user-fixtures.txt').write_text('\n'.join([
+        'redis://' + ':synthetic@localhost/0',
+        'redis://' + ':anything@host.invalid/0',
+        'redis://' + ':@cache.example.com/0',
+    ]) + '\n')
+    scan=subprocess.run(['sh', str(scripts/'secret-scan.sh'), str(out.parent)], capture_output=True, text=True)
+    check(scan.returncode==0 and not scan.stdout and not scan.stderr, '空用户名 fixture 与空密码不误报')
     (out.parent/'external').symlink_to(out)
     Path(str(out)+'.done').write_text('done')
     env['FAKE_NO_DONE']='1'

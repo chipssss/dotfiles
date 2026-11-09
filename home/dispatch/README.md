@@ -11,7 +11,10 @@ Copy `dispatch.config.example` to `~/.config/dispatch/config`, or set `DISPATCH_
 Only safety policy and a port range go in this file. Missing/broken policy, unknown
 keys and duplicates fail closed. Default strict approval mode requires a nonempty
 protected-branch list; `main` and `master` are always added. Explicit `generic` mode
-only knows those built-in branches unless more are listed.
+only knows those built-in branches unless more are listed. `dispatchconf.py` owns
+all setting defaults and built-in protected branches; launcher, approval, scanner
+and doctor use the same effective settings. Explicit empty values do not restore
+defaults (and an empty protected list still fails in strict mode).
 
 Home Manager links `dispatch` and `pi-worker`; helpers remain beside their real files.
 Before deploying a changed checkout, compare hand-installed copies with doctor.
@@ -126,11 +129,71 @@ startup or collection, and is not a reusable public-PR gate. Existing historical
 metadata is not rewritten. Choose the new-commit base explicitly.
 
 The credential scanner checks OpenAI/Anthropic API key shapes, GitHub tokens,
-`BEGIN ... PRIVATE KEY` headers, three-part JWT-shaped strings, and generic
-`scheme://user:password@host.invalid/path`-shaped URLs, including nested/binary output. Password URLs
-on reserved `.invalid` hosts are fixtures; on loopback (`localhost`, `127.0.0.1`,
-`[::1]`) only configured fixture passwords are exempt. Other loopback passwords
-are still flagged. URLs without a password are not flagged by this rule.
+`BEGIN ... PRIVATE KEY` headers (including `BEGIN PGP PRIVATE KEY BLOCK`),
+three-part JWT-shaped strings, and generic
+`scheme://user:password@host.invalid/path`-shaped URLs, including empty usernames
+such as `redis://:password@host.invalid/0` and nested/binary output. Password URLs
+on reserved `.invalid` fixture hosts retain their existing exemption. Loopback
+exemptions instead require the **entire URL** to match this allowlisted shape:
+
+```text
+<scheme>://user:password@HOST[:PORT]/DBNAME[?QUERY]
+```
+
+- `HOST` is exactly `localhost`, `127.0.0.1`, or `[::1]` (case-insensitive).
+  Bare `::1` is deliberately not exempt. Usernames may be empty; userinfo cannot
+  contain an extra `@`.
+- `PORT`, if present, is digits only or one complete, nonempty `${{ ... }}` CI
+  expression. The expression is not evaluated, cannot contain an internal `}}`,
+  and may contain spaces and quotes. No concatenated templates or trailing text.
+- `DBNAME` is required and contains only `[A-Za-z0-9_-]+`, never templates,
+  percent escapes, or extra slashes.
+- Optional `QUERY` is `name=value` pairs joined by `&`. Names are the literal,
+  lowercase `sslmode`, `application_name`, or `connect_timeout`; values contain
+  only `[A-Za-z0-9_.-]*` (empty values are allowed). No other names, percent
+  escapes, `#`, extra `=`, or semicolons are exempt.
+- An unquoted URL must consume the rest of its line, apart from trailing spaces
+  or tabs and an optional ` #` comment (whitespace before `#` is required).
+  Whitespace or stray quotes followed by `?host=` do not end a plain scalar.
+- A URL immediately preceded by a single/double quote must close with the **same
+  quote**, followed by whitespace, end of line, or `,`, `}`, `]`. This preserves
+  quoted YAML/JSON values. An unquoted second URL or arbitrary suffix on the
+  same line makes the first URL non-exempt; independently detected URLs still scan.
+
+Even with this shape, the password **must** be in `secret_fixture_passwords`
+(default: `postgres synthetic`). A CI template port never exempts an arbitrary
+password. An explicit empty list disables all loopback exemptions, including CI.
+All other detected password URLs are reported, including numeric-port SSH tunnel
+passwords, host lookalikes, multiple hosts, encoded query names, and path templates.
+For example, this default fixture is exempt with or without `?sslmode=disable`:
+
+```yaml
+TEST_DATABASE_URL: postgresql://postgres:synthetic@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/app_test
+```
+
+For a CI service container that generates a one-time password, add that exact
+password to the **local** `~/.config/dispatch/config`, or select a private
+machine/project-specific config using `DISPATCH_CONFIG=/path/to/private/config`.
+Set the following key there, replacing the placeholder locally:
+
+```ini
+secret_fixture_passwords = postgres synthetic <one-time-ci-password>
+```
+
+This key replaces, rather than extends, the defaults: keep `postgres synthetic`
+if those fixtures are still needed. Never add the one-time password to this public
+repository, its example config, or test fixtures. Do not allowlist production or
+reusable credentials. Allowlisting a password does not relax the URL shape check.
+
+Common shapes that **are reported even with an allowlisted password** include:
+URLs without a database name (such as `redis://` + `:pw@localhost:6379`), a trailing `/`,
+Prisma's `?schema=public`, dotted database names (`app.test`), other query parameters
+(such as `charset`, `TimeZone`, `authSource`), Markdown backticks and links
+(including `<url>`), and unquoted trailing `,`, `;`, or `}`. Rewrite fixtures to the
+specified shape; adding the password alone cannot exempt these forms.
+
+Whitelist changes affect both scanner behavior and doctor's effective-config
+fingerprint. URLs without a password are not flagged by this rule.
 It prints locations/categories, never matched values. These patterns and custom
 regexes are finite checks, not proof that arbitrary data is non-secret. Human
 inspection remains necessary.

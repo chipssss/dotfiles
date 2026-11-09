@@ -27,7 +27,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-doctor-', dir='/private/tmp') 
     config = root / 'config'
     config.write_text('protected_branches = main release/*\n')
     bin_dir = root / 'bin'; bin_dir.mkdir()
-    for tool in ['python3', 'git']:
+    for tool in ['python3', 'git', 'dirname']:
         (bin_dir / tool).symlink_to(shutil.which(tool))
     for tool in ['pi', 'rex', 'lsof', 'osascript', 'sandbox-exec', 'realpath']:
         p = bin_dir / tool
@@ -73,4 +73,90 @@ with tempfile.TemporaryDirectory(prefix='dispatch-doctor-', dir='/private/tmp') 
     config.write_text('protected_branches =\n')
     assert doctor(1)['config_sha256'] is None
     print('PASS: doctor pure JSON, effective config, dirty checkout, installation and failure states')
+
+    # Simulate changing the shared defaults in an isolated checkout. Policy
+    # consumers must observe the change, not just doctor or one helper.
+    defaults_module = scripts / 'dispatchconf.py'
+    defaults_module.write_text(defaults_module.read_text() + '''
+DEFAULTS = dict(ports='4510-4599', approval_mode='generic', protected_branches='',
+                temp_dirs='.tmp/', secret_fixture_passwords='demo-fixture')
+''')
+    config.write_text('protected_branches = main release/*\n')
+    changed = doctor()['config_sha256']
+    config.write_text('''protected_branches = main release/*
+ports = 4510-4599
+approval_mode = generic
+temp_dirs = .tmp/
+secret_fixture_passwords = demo-fixture
+''')
+    assert doctor()['config_sha256'] == changed, 'doctor must fingerprint the shared defaults'
+
+    # Even the validation path must use the new port default.
+    original_module = defaults_module.read_text()
+    defaults_module.write_text(original_module + "\nDEFAULTS['ports'] = '80-89'\n")
+    config.write_text('protected_branches = main release/*\n')
+    assert doctor(1)['config_sha256'] is None, 'invalid default ports must fail validation'
+    defaults_module.write_text(original_module)
+
+    # Local-only CLI probes, no runner, pane, external remote or actual deletion.
+    git('branch', '-M', 'main')
+    bare = root / 'remote.git'
+    subprocess.run(['git', 'init', '--bare', '-q', str(bare)], check=True)
+    git('remote', 'add', 'origin', str(bare))
+    git('push', '-q', 'origin', 'main')
+    git('checkout', '-qb', 'feature/demo')
+    env.update(DISPATCH_REPO=str(repo), DISPATCH_STATE_DIR=str(root / 'state'),
+               DISPATCH_WORKTREE_ROOT=str(root / 'wt'), PI_SCRIPTS=str(scripts),
+               PI_APPROVE_CWD=str(repo))
+    (bin_dir / 'lsof').unlink()
+    (bin_dir / 'lsof').write_text('#!/bin/sh\nexit 1\n')
+    (bin_dir / 'lsof').chmod(0o755)
+    brief = root / 'brief'; brief.write_text('Generic fixture task')
+    p = subprocess.run([str(scripts / 'dispatch'), 'start', 'DEMO', str(brief), '--dry-run', '--base', 'main'],
+                       env=env, capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert 'ports 4510-4519' in p.stdout, 'launcher must allocate from the shared port default'
+    assert not (root / 'state').exists() and not (root / 'wt').exists()
+
+    def approve(command, kind, expected):
+        text = f'Confirm external or irreversible action\nAllow {kind}?\n\n{command}\n↑↓ navigate\n'
+        p = subprocess.run(['/bin/sh', '-c', '. "$PI_SCRIPTS/approve-rules.sh"; safe_ask "$1"', 'test', text],
+                           env=env, capture_output=True)
+        assert p.returncode == expected, f'approval must use shared defaults: {command}'
+    approve(f'rm -rf {root}/artifact', 'recursive deletion', 1)
+    approve('rm -rf .tmp/artifact', 'recursive deletion', 0)
+    config.write_text('')
+    approve('git push origin feature/demo', 'git push', 0)
+    config.write_text('approval_mode = strict\n')
+    approve('git push origin feature/demo', 'git push', 1)
+    config.write_text('')
+
+    artifact = root / 'artifact'
+    def scan(password, expected, host='localhost'):
+        artifact.write_text('redis://' + 'fixture:' + password + '@' + host + '/test\n')
+        p = subprocess.run([str(scripts / 'secret-scan.sh'), str(artifact)], env=env, capture_output=True)
+        assert p.returncode == expected, 'scanner must use the shared fixture password whitelist on exact loopbacks'
+    scan('demo-fixture', 0)
+    scan('postgres', 1)
+    scan('demo-fixture', 1, host='cache.example.com')
+    default_fingerprint = doctor()['config_sha256']
+    config.write_text('secret_fixture_passwords = override-fixture\n')
+    override_fingerprint = doctor()['config_sha256']
+    assert override_fingerprint != default_fingerprint
+    scan('demo-fixture', 1)
+    scan('override-fixture', 0)
+    scan('override-fixture', 1, host='cache.example.com')
+    config.write_text('secret_fixture_passwords = override-fixture  override-fixture\n')
+    assert doctor()['config_sha256'] == override_fingerprint
+    config.write_text('secret_fixture_passwords =\n')
+    assert doctor()['config_sha256'] not in (default_fingerprint, override_fingerprint)
+    scan('demo-fixture', 1)
+    scan('override-fixture', 1)
+    # Missing config remains fail-closed for approval, but scanning may use defaults.
+    config.unlink()
+    approve('git push origin feature/demo', 'git push', 1)
+    env.pop('DISPATCH_CONFIG')
+    scan('demo-fixture', 0)
+    scan('demo-fixture', 1, host='cache.example.com')
+    print('PASS: shared defaults drive doctor, validation, launcher, approval and scanner; whitelist changes affect scanning and config hash')
 PY
