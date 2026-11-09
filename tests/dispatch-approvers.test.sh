@@ -19,7 +19,7 @@ root = Path(tempfile.mkdtemp(prefix='PITOOL-test-', dir='/private/tmp'))
 passed = 0
 config = root / 'dispatch.config'
 config.write_text('''protected_branches = main stack/* shared/* release/*
-temp_dirs = /tmp/ /private/tmp/ ../tmp- .tmp/
+temp_dirs = /tmp/ /private/tmp/ .tmp/
 temp_containers = tmp-
 db_wrapper = scripts/readonly-psql.sh
 secret_pattern.demo token = \\bdemo_[A-Za-z0-9_-]{20,}
@@ -60,7 +60,7 @@ def approve(name, command, expected=0, kind='git push', menu=True, prefix=''):
 try:
     for name, cmd, code in [
         ('双空格安全 rm', 'rm -rf  /private/tmp/PITOOL-safe', 0),
-        ('两个安全 rm 连写', 'rm -rf /tmp/a && rm -rf ../tmp-pitool', 0),
+        ('复合 rm 交人工', 'rm -rf /tmp/a && rm -rf ../tmp-pitool', 1),
         ('双空格相邻仓库 rm', 'rm -rf  ../project', 1),
         ('全部 rm 目标都检查', 'rm -rf /tmp/a ../project', 1),
         ('临时目录穿越', 'rm -rf /private/tmp/../../Users', 1),
@@ -68,12 +68,12 @@ try:
         ('多个临时容器', 'docker rm -fv tmp-task-pg tmp-task-redis', 0),
         ('postgres-main 容器', 'docker rm -fv postgres-main', 1),
         ('混合容器拒绝', 'docker rm -fv tmp-task-pg postgres-main', 1),
-        ('临时容器加安全目录', 'docker rm -fv tmp-task-pg; rm -rf /tmp/a', 0),
+        ('临时容器加目录交人工', 'docker rm -fv tmp-task-pg; rm -rf /tmp/a', 1),
         ('临时容器加相邻仓库', 'docker rm -fv tmp-task-pg; rm -rf ../project', 1),
     ]:
         approve(name, cmd, code, 'recursive deletion')
     for name, cmd, code in [
-        ('merge 后推功能分支', 'git merge origin/stack/identity && git push origin feature/pitool', 0),
+        ('merge 后推功能分支交人工', 'git merge origin/stack/identity && git push origin feature/pitool', 1),
         ('stack refspec', 'git push origin HEAD:stack/identity', 1),
         ('force', 'git push --force origin feature/pitool', 1),
         ('force lease', 'git push --force-with-lease origin feature/pitool', 1),
@@ -92,11 +92,11 @@ try:
         approve(name, cmd, code)
     cd = f'cd "{repo}" && '
     for suffix in ['', '; echo complete', ' && echo complete', '\necho complete', ' -u']:
-        approve('功能分支裸 push ' + repr(suffix), cd + 'git push' + suffix)
+        approve('cd 复合 push 交人工 ' + repr(suffix), cd + 'git push' + suffix, 1)
     approve('软换行不能隐藏 main 目标', cd + 'git push\norigin main', 1)
     approve('软换行不能隐藏 stack 目标', cd + 'git push origin\nHEAD:stack/identity', 1)
     approve('软换行不能隐藏强推', cd + 'git push\n--force origin feature/pitool', 1)
-    approve('git 与 push 之间软换行的功能分支 push', 'git\n push origin feature/pitool > /tmp/push.log 2>&1 &')
+    approve('换行和重定向交人工', 'git\n push origin feature/pitool > /tmp/push.log 2>&1 &', 1)
     approve('git 与 push 之间软换行仍拦 main', 'git\npush origin main', 1)
     approve('半渲染对话', 'git push origin main', 2, menu=False)
     approve('半渲染 rm 对话', 'cp /p', 2, 'recursive deletion', menu=False)
@@ -109,7 +109,7 @@ try:
                 'psql postgres://fake.invalid/db', 'psql postgresql://fake.invalid/db']:
         p = approve('原始数据库命令硬拒绝', cmd + '; git push origin feature/pitool', 1)
         check('请改用 scripts/readonly-psql.sh' in p.stdout, '数据库拒绝提示不含原命令')
-    approve('只读包装脚本放行', 'scripts/readonly-psql.sh --file /tmp/query.sql; git push origin feature/pitool')
+    approve('包装脚本加 push 交人工', 'scripts/readonly-psql.sh --file /tmp/query.sql; git push origin feature/pitool', 1)
     approve('包装脚本在数据库确认中放行', 'scripts/readonly-psql.sh --file /tmp/DATABASE_URL.sql', 0, 'database read')
     approve('包装脚本加嵌套原始 psql 不放行', 'scripts/readonly-psql.sh; bash -c \'psql "$DATABASE_URL"\'; git push origin feature/pitool', 1)
     approve('提及脚本不是调用', 'echo scripts/readonly-psql.sh; psql "$DATABASE_URL"; git push origin feature/pitool', 1)
@@ -122,8 +122,8 @@ try:
                 "bash -c 'pgrep -fl node'", "'pgrep' '-af' node"]:
         p = approve('完整命令行查询拒绝', cmd + '; git push origin feature/pitool', 1)
         check('进程命令行' in p.stdout, '进程查询拒绝不回显原命令')
-    approve('PID-only pgrep 放行', 'pgrep -x node; git push origin feature/pitool')
-    approve('端口 PID 查询放行', 'lsof -nP -iTCP:3001 -sTCP:LISTEN -t; git push origin feature/pitool')
+    approve('PID-only pgrep 复合命令交人工', 'pgrep -x node; git push origin feature/pitool', 1)
+    approve('端口查询复合命令交人工', 'lsof -nP -iTCP:3001 -sTCP:LISTEN -t; git push origin feature/pitool', 1)
     for branch in ['stack/identity', 'shared/x', 'release/v1', 'main']:
         git('checkout', '-qB', branch)
         git('config', f'branch.{branch}.remote', 'origin')
@@ -137,7 +137,7 @@ try:
     git('config', '--unset', 'branch.feature/pitool.merge')
     approve('无上游裸 push', cd + 'git push', 1)
 
-    # Without a project config the rules fall back to generic defaults; a configured but missing file fails closed.
+    # Missing default and explicit config both fail closed; generic policy is explicit opt-in.
     def approve_with(name, command, expected, kind, env):
         p = subprocess.run(['sh', '-c', '. "$1/approve-rules.sh"; safe_ask "$2"; r=$?; printf "%s" "$APPROVAL_REASON"; exit "$r"',
                             'test', str(scripts), ask(kind, command)], capture_output=True, text=True, env=env)
@@ -146,10 +146,10 @@ try:
     bare = {k: v for k, v in os.environ.items() if k != 'DISPATCH_CONFIG'}
     bare['HOME'] = str(root / 'empty home')
     approve_with('无配置时 main 仍受保护', 'git push origin main', 1, 'git push', bare)
-    approve_with('无配置时项目分支前缀不受保护', 'git push origin HEAD:stack/identity', 0, 'git push', bare)
+    approve_with('无配置时项目分支也等人工', 'git push origin HEAD:stack/identity', 1, 'git push', bare)
     approve_with('无配置时临时容器不自动删除', 'docker rm -fv tmp-task-pg', 1, 'recursive deletion', bare)
     p = approve_with('无配置时带凭据的 psql 等人工', 'psql "$DATABASE_URL"', 1, 'git push', bare)
-    check('人工确认' in p.stdout, '无包装脚本时的数据库提示是通用的')
+    check('人工确认' in p.stdout, '无配置时提示需要人工确认')
     approve_with('配置文件缺失时全部等人工', 'git push origin feature/pitool', 1, 'git push',
                  dict(os.environ, DISPATCH_CONFIG=str(root / 'missing.config')))
 

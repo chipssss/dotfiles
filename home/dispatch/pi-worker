@@ -17,7 +17,7 @@ PI_SCRIPTS=$(dirname -- "$(realpath -- "$0")")
 export PI_SCRIPTS
 . "$PI_SCRIPTS/approve-rules.sh"
 . "$PI_SCRIPTS/completion-rules.sh"
-model= thinking=high readonly=0 cwd= prompt= out= label= timeout=90 idle=10 contexts= attach=
+model='' thinking=high readonly=0 cwd='' prompt='' out='' label='' timeout=90 idle=10 contexts='' attach=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) model=$2; shift 2 ;;
@@ -69,10 +69,13 @@ else
   fi
   if [ -n "$contexts" ]; then
     set -- "$@" --no-context-files
-    for f in $(printf "$contexts"); do
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
       [ -f "$f" ] || { echo "pi-worker: no context file $f" >&2; exit 64; }
       set -- "$@" --append-system-prompt "$f"
-    done
+    done <<EOF
+$contexts
+EOF
   fi
   brief="$(cat "$prompt")
 
@@ -90,7 +93,7 @@ printf '%s\n' "$block" > "$out.block"
 # shellcheck disable=SC2086
 trap 'rex block close $scope "$block" >/dev/null 2>&1; exit 143' TERM INT HUP
 deadline=$(( $(date +%s) + timeout * 60 ))
-last_screen= last_change=$(date +%s) needs= stuck= nudged=0 resumes=0
+last_screen='' last_change=$(date +%s) needs='' stuck='' nudged=0 resumes=0
 set_stuck() {
   [ "$stuck" = "$1" ] && return 0
   stuck=$1

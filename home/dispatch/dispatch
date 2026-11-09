@@ -4,7 +4,7 @@
   dispatch start NAME BRIEF.md [--base main] [--branch B] [--common FILE] [--card ID | --new-card TITLE] [--dry-run]
   dispatch status [--json]          every worker: phase, why it is stuck, PR, review verdict
   dispatch wait [CURSOR]            block until new events (DONE / NEEDS HUMAN / STUCK / REVIEWED ...)
-  dispatch review NAME | --pr N --author pi|claude --brief FILE   cross-family review of the PR head
+  dispatch review NAME | --pr N --author provider/model --brief FILE   review the head/base snapshot
   dispatch merge PR [--dry-run]     merge, only with an APPROVE verdict for the current head
   dispatch adopt NAME --out FILE    supervise a pi pane started without dispatch
   dispatch clean NAME [--force]     close pane, remove worktree, local and remote branch, free ports
@@ -15,6 +15,8 @@ $DISPATCH_CONFIG or ~/.config/dispatch/config; see dispatch.config.example next 
 """
 import argparse
 import datetime
+import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -199,7 +201,7 @@ def compose_brief(state, task_brief, common):
     card = f'工作卡 {state["card"]}' if state.get('card') else '本任务没有工作卡，跳过卡片更新'
     parts.append(f"""## 本次分配（dispatch 生成，与上文冲突时以此为准）
 - 任务名 {state['name']}；最终报告写 `{state['out']}`。
-- worktree 已建好：`{state['worktree']}`，分支 `{state['branch']}` 从 `origin/{state['base']}` 切出，origin 上已有同名分支并设为上游。只在这个 worktree 里改，推送直接 `git push`；不要再建 worktree，不要改上游。
+- worktree 已建好：`{state['worktree']}`，分支 `{state['branch']}` {'续写已有 PR #' + str(state['pr']) if state.get('resumed') else '从 origin/' + state['base'] + ' 切出'}，origin 同名分支为上游。只在这个 worktree 里改，推送直接 `git push`；不要再建 worktree，不要改上游。
 - 端口段 {p['base']}-{p['last']}：API 用 {p['api']}，前端用 {p['web']}，其余端口在段内取。
 - {card}。
 - 确认框由监管自动处理：安全操作自动放行，其余操作会通知协调者并等待，你不用退出或重试。
@@ -209,12 +211,34 @@ def compose_brief(state, task_brief, common):
     return '\n\n'.join(parts)
 
 
+def normalize_base(base):
+    if base.startswith('origin/'):
+        base = base[len('origin/'):]
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./-]*', base) or '..' in base or base.startswith(('upstream/', 'refs/')):
+        raise Refused('--base 只接受 origin 上的分支名或 origin/分支名')
+    if REPO.exists():
+        remotes = run(['git', '-C', REPO, 'remote'], check=False).stdout.split()
+        if any(base.startswith(r + '/') for r in remotes if r != 'origin'):
+            raise Refused('--base 不支持其他 remote 前缀')
+    return base
+
+
+def protected_branch(branch):
+    return any(fnmatch.fnmatchcase(branch, p) for p in
+               ['main', 'master', *dispatchconf.words(CONF, 'protected_branches')])
+
+
 def cmd_start(a):
     if not re.fullmatch(r'[A-Za-z0-9_-]+', a.name):
         raise Refused('NAME 只能含字母、数字、- 和 _')
     if not Path(a.brief).is_file():
         raise Refused(f'没有 brief 文件 {a.brief}')
+    a.base = normalize_base(a.base)
     branch = a.branch or f'dispatch/{a.name.lower()}'
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./-]*', branch) or '..' in branch or protected_branch(branch):
+        raise Refused('worker 分支不合法或属于受保护分支')
+    if run(['git', 'check-ref-format', '--branch', branch], check=False).returncode:
+        raise Refused('worker 分支不是合法 Git ref')
     wt = WT_ROOT / a.name
     if a.dry_run:
         return dry_run_start(a, branch, wt)
@@ -223,36 +247,94 @@ def cmd_start(a):
             raise Refused(f'{a.name} 已存在；先 dispatch clean {a.name}')
         if wt.exists():
             raise Refused(f'{wt} 已存在')
-        run(['git', '-C', REPO, 'fetch', '-q', 'origin', a.base])
-        if run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', branch], check=False).returncode == 0:
-            raise Refused(f'origin 上已有分支 {branch}')
-        trust_worktree_root()
-        # --no-track: a worktree tracking origin/<base> makes a bare push look like a push to the shared base.
-        run(['git', '-C', REPO, 'worktree', 'add', '-q', '--no-track', '-b', branch, wt, f'origin/{a.base}'])
-        sha = run(['git', '-C', wt, 'rev-parse', 'HEAD']).stdout.strip()
-        # Create the remote branch through the API (no pre-push hook on an empty branch), then track it.
-        gh('api', '-X', 'POST', 'repos/{owner}/{repo}/git/refs', '-f', f'ref=refs/heads/{branch}', '-f', f'sha={sha}')
-        run(['git', '-C', wt, 'fetch', '-q', 'origin', f'{branch}:refs/remotes/origin/{branch}'])
-        run(['git', '-C', wt, 'branch', '-q', f'--set-upstream-to=origin/{branch}'])
-        state = {
-            'name': a.name, 'branch': branch, 'base': a.base, 'base_sha': sha, 'worktree': str(wt),
-            'ports': allocate_ports(), 'card': a.card or (create_card(a.name, a.new_card) if a.new_card else None),
-            **worker_model(a), 'author_family': 'pi', 'timeout_min': a.timeout,
-            'task_brief': str(Path(a.brief).resolve()), 'out': str(EVIDENCE / a.name / 'result.md'),
-            'started_at': now(),
-        }
+        state = prepare_start(a, branch, wt)
+        state.update(phase='preparing', owns_local=False, owns_remote=False)
         save(state)
-    brief = worker_dir(a.name) / 'brief.md'
-    brief.write_text(compose_brief(state, a.brief, a.common))
-    spawn_runner(a.name)
+        try:
+            trust_worktree_root()
+            start_ref = branch if a.existing_branch else a.base
+            run(['git', '-C', REPO, 'fetch', '-q', 'origin', f'{start_ref}:refs/remotes/origin/{start_ref}'])
+            state['local_pending'] = True
+            save(state)
+            run(['git', '-C', REPO, 'worktree', 'add', '-q', '--no-track', '-b', branch, wt, f'origin/{start_ref}'])
+            state.update(owns_local=True, local_pending=False)
+            save(state)
+            sha = run(['git', '-C', wt, 'rev-parse', 'HEAD']).stdout.strip()
+            state['base_sha'] = sha
+            if not a.existing_branch:
+                state['remote_pending'] = True
+                save(state)
+                gh('api', '-X', 'POST', 'repos/{owner}/{repo}/git/refs', '-f', f'ref=refs/heads/{branch}', '-f', f'sha={sha}')
+                state.update(owns_remote=True, remote_pending=False)
+                save(state)
+            elif sha != state['resume_head']:
+                raise Refused('已有 PR head 在启动期间改变，清理本次 worktree 后重试')
+            run(['git', '-C', wt, 'fetch', '-q', 'origin', f'{branch}:refs/remotes/origin/{branch}'])
+            run(['git', '-C', wt, 'branch', '-q', f'--set-upstream-to=origin/{branch}'])
+            state['card'] = a.card or (create_card(a.name, a.new_card) if a.new_card else None)
+            brief = worker_dir(a.name) / 'brief.md'
+            brief.write_text(compose_brief(state, a.brief, a.common))
+            state['phase'] = 'ready'
+            save(state)
+            spawn_runner(a.name)
+        except Exception as e:
+            state['phase'], state['failure'] = 'failed', type(e).__name__
+            save(state)
+            raise Refused(f'start 失败（{type(e).__name__}）；状态已保留，用 status 查看并 clean {a.name} 后重试') from e
     p = state['ports']
     print(f'started {a.name}: worktree {wt} branch {branch} ports {p["base"]}-{p["last"]} card {state["card"] or "-"}')
     print(f'brief {brief}\nout {state["out"]}\nlog {worker_dir(a.name) / "supervisor.log"}')
 
 
+def model_family(model):
+    """A runner name or a caller-supplied family label is not model identity."""
+    if not isinstance(model, str):
+        raise Refused('缺少实际模型身份')
+    slug = model.removeprefix('pi:')
+    if re.fullmatch(r'(?:anthropic/)?claude-[A-Za-z0-9.-]+', slug) or slug in ('opus', 'sonnet', 'haiku'):
+        return 'anthropic'
+    if re.fullmatch(r'(?:openai|openai-codex)/(?:gpt-[A-Za-z0-9.-]+|o[134](?:-[A-Za-z0-9.-]+)?)', slug):
+        return 'openai'
+    raise Refused('无法可靠识别实际模型族，请使用明确的 provider/model slug')
+
+
 def worker_model(a):
-    return {'model': a.model or CONF.get('worker_model', 'openai/gpt-6.1-sol'),
+    model = a.model or CONF.get('worker_model', 'openai/gpt-6.1-sol')
+    if '/' not in model:
+        raise Refused('Pi worker 必须提供明确的 provider/model，不接受模糊 alias')
+    return {'model': model, 'author_model': model, 'author_family': model_family(model), 'runner': 'pi',
             'thinking': a.thinking or CONF.get('worker_thinking', 'high')}
+
+
+def prepare_start(a, branch, wt):
+    """Shared read-only preflight, before allocating external resources."""
+    if run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', a.base], check=False).returncode:
+        raise Refused(f'origin 上没有 base 分支 {a.base}')
+    for state in workers():
+        if state.get('branch') == branch:
+            raise Refused('已有 worker 登记了此分支；先检查旧状态和监管进程')
+    remote_status = run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', branch], check=False).returncode
+    if remote_status not in (0, 2):
+        raise Refused('无法核对远端分支，拒绝启动')
+    remote_exists = remote_status == 0
+    if remote_exists != a.existing_branch:
+        raise Refused(f'origin 分支 {branch} ' + ('不存在' if a.existing_branch else '已存在；续写请显式加 --existing-branch'))
+    if run(['git', '-C', REPO, 'show-ref', '--verify', '--quiet', f'refs/heads/{branch}'], check=False).returncode == 0:
+        raise Refused('本地已有同名分支或 worktree；先检查其归属，不自动覆盖')
+    state = {'name': a.name, 'branch': branch, 'base': a.base, 'worktree': str(wt),
+             'ports': allocate_ports(), 'card': a.card, **worker_model(a), 'timeout_min': a.timeout,
+             'task_brief': str(Path(a.brief).resolve()), 'out': str(EVIDENCE / a.name / 'result.md'), 'started_at': now()}
+    if a.existing_branch:
+        pr = find_pr(branch)
+        if not pr or pr['state'] != 'OPEN' or pr.get('isCrossRepository', True) or pr.get('headRefName') != branch:
+            raise Refused('续写只接受当前 origin 仓库的 OPEN PR 分支，不接受 fork')
+        if pr['baseRefName'] != a.base:
+            raise Refused('已有 PR 的 base 不匹配，请明确指定 --base')
+        state.update(pr=pr['number'], resume_head=pr['headRefOid'], resumed=True)
+    if a.new_card:
+        card_command(a.name, a.new_card)
+    compose_brief(state, a.brief, a.common)
+    return state
 
 
 def dry_run_start(a, branch, wt):
@@ -262,11 +344,8 @@ def dry_run_start(a, branch, wt):
         problems.append(f'{a.name} 已存在；先 dispatch clean {a.name}')
     if wt.exists():
         problems.append(f'{wt} 已存在')
-    if run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', a.base], check=False).returncode:
-        problems.append(f'origin 上没有 base 分支 {a.base}')
-    if run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', branch], check=False).returncode == 0:
-        problems.append(f'origin 上已有分支 {branch}')
-    ports = allocate_ports()
+    prepared = prepare_start(a, branch, wt)
+    ports = prepared['ports']
     card = a.card or (shlex.join(card_command(a.name, a.new_card)) + '（未执行）' if a.new_card else '-')
     state = {'name': a.name, 'branch': branch, 'base': a.base, 'worktree': str(wt), 'ports': ports,
              'card': a.card or (f'<--new-card {a.new_card}>' if a.new_card else None),
@@ -276,7 +355,7 @@ def dry_run_start(a, branch, wt):
     for k, v in [('repo', REPO), ('worktree', wt), ('branch', f'{branch}（从 origin/{a.base}）'),
                  ('ports', f'{ports["base"]}-{ports["last"]}'), ('card', card), ('out', state['out']),
                  ('brief', f'{len(brief.splitlines())} 行，worker 收到的完整 brief'),
-                 ('model', ' '.join(worker_model(a).values())),
+                 ('model', prepared['model']),
                  ('pi-worker', PI_WORKER)]:
         print(f'  {k:9} {v}')
     if problems:
@@ -319,7 +398,7 @@ def cmd_run(a):
         pr = find_pr(state['branch'])
         if pr and pr['state'] == 'OPEN':
             try:
-                review(pr['number'], state['author_family'], str(d / 'brief.md'), state.get('worktree'), state['out'])
+                review(pr['number'], state.get('author_model', ''), str(d / 'brief.md'), state.get('worktree'), state['out'])
             except Refused as e:
                 notify(f'REVIEW FAILED {a.name} PR#{pr["number"]}: {e}')
 
@@ -340,7 +419,7 @@ def collect(state, code):
 
 def find_pr(branch):
     prs = json.loads(gh('pr', 'list', '--head', branch, '--state', 'all', '--limit', '5', '--json',
-                        'number,state,isDraft,headRefOid,url,baseRefName').stdout)
+                        'number,state,isDraft,headRefOid,headRefName,url,baseRefName,isCrossRepository').stdout)
     return prs[0] if prs else None
 
 
@@ -351,51 +430,76 @@ def reviewer_for(author_family):
                 spec = entry.split()
                 if len(spec) != 2:
                     continue
-                family = 'pi' if spec[0].startswith('pi:') else 'claude'
+                runner = 'pi' if spec[0].startswith('pi:') else 'claude'
+                model = spec[0].removeprefix('pi:')
+                family = model_family(model)
+                if (runner == 'pi' and '/' not in model) or (runner == 'claude' and family != 'anthropic'):
+                    raise Refused('评审 runner 与实际模型身份不匹配或模型 alias 有歧义')
                 if family != author_family:
-                    return {'family': family, 'model': spec[0].removeprefix('pi:'), 'effort': spec[1]}
+                    return {'runner': runner, 'family': family, 'model': model, 'effort': spec[1]}
     raise Refused(f'{MODELS} 的「{REVIEW_ROLE}」没有与作者（{author_family}）不同族的模型')
 
 
-def review_dir(pr, head):
-    return ROOT / 'reviews' / f'pr-{pr}' / head
+def snapshot(pr):
+    return (pr['headRefOid'], pr['baseRefName'], pr['baseRefOid'])
+
+
+def review_dir(pr, head, view=None):
+    root = ROOT / 'reviews' / f'pr-{pr}' / head
+    if view is None:
+        return root  # Legacy records are never accepted by review/merge.
+    key = hashlib.sha256(json.dumps(snapshot(view)).encode()).hexdigest()
+    return root / key
+
+
+def pr_view(number):
+    return json.loads(gh('pr', 'view', str(number), '--json',
+                         'number,url,headRefOid,baseRefName,baseRefOid,state').stdout)
 
 
 def review(number, author_family, brief, worktree=None, report=None, force=False):
-    view = lambda: json.loads(gh('pr', 'view', str(number), '--json',
-                                 'number,url,headRefOid,baseRefName,state').stdout)
+    author_model = author_family
+    author_family = model_family(author_model)
+    view = lambda: pr_view(number)
     pr = view()
     head = pr['headRefOid']
-    d = review_dir(number, head)
+    d = review_dir(number, head, pr)
     verdict_file = d / 'verdict.json'
     if verdict_file.exists() and not force:
-        print(verdict_file.read_text())
-        return json.loads(verdict_file.read_text())
+        cached = json.loads(verdict_file.read_text())
+        if cached.get('author_model') == author_model:
+            print(verdict_file.read_text())
+            return cached
+        raise Refused('作者实际模型身份改变，使用 --force 重新评审')
     (d / 'out').mkdir(parents=True, exist_ok=True)
     if alive(d / 'reviewing.pid'):
         raise Refused(f'PR#{number} head {head[:9]} 已有评审在跑')
     (d / 'reviewing.pid').write_text(str(os.getpid()))
     try:
         diff = gh('pr', 'diff', str(number)).stdout
-        if view()['headRefOid'] != head:
-            raise Refused('取 diff 时 PR head 变了，重跑 review')
+        if snapshot(view()) != snapshot(pr):
+            raise Refused('取 diff 时 PR head 或 base 变了，重跑 review')
         (d / 'diff.patch').write_text(diff)
         reviewer = reviewer_for(author_family)
         out = d / 'out' / 'review.md'
-        scan = run([str(SCRIPTS / 'secret-scan.sh'), str(d / 'diff.patch')], check=False)
+        scan = run([sys.executable, str(SCRIPTS / 'public-check'), '--repo', str(REPO),
+                    '--base', pr['baseRefOid'], '--head', head, '--pr', str(number)], check=False)
         if scan.returncode:
-            out.write_text('VERDICT: REQUEST_CHANGES\n\nPR diff 含疑似凭据，未交给模型评审：\n' + scan.stdout)
+            out.write_text('VERDICT: REQUEST_CHANGES\n\n公开载荷检查未通过，未交给模型评审：\n' + scan.stdout)
             reviewer = {'family': 'tool', 'model': 'secret-scan.sh', 'effort': '-'}
         else:
             code_dir = worktree if worktree and Path(worktree).is_dir() and run(
                 ['git', '-C', worktree, 'rev-parse', 'HEAD'], check=False).stdout.strip() == head else None
             prompt = d / 'prompt.md'
             prompt.write_text(review_prompt(pr, author_family, brief, report, code_dir, d / 'diff.patch',
-                                            out if reviewer['family'] == 'pi' else None))
+                                            out if reviewer['runner'] == 'pi' else None))
             run_reviewer(reviewer, prompt, out, code_dir or str(d), number)
         verdict = parse_verdict(out)
-        record = {'pr': number, 'url': pr['url'], 'head': head, 'base': pr['baseRefName'], 'verdict': verdict,
-                  'author_family': author_family, 'reviewer': reviewer, 'reviewed_at': now(),
+        if snapshot(view()) != snapshot(pr):
+            raise Refused('评审期间 PR head 或 base 变了，结论作废，请重评')
+        record = {'pr': number, 'url': pr['url'], 'head': head, 'base': pr['baseRefName'],
+                  'base_sha': pr['baseRefOid'], 'verdict': verdict,
+                  'author_family': author_family, 'author_model': author_model, 'reviewer': reviewer, 'reviewed_at': now(),
                   'review': str(out), 'diff': str(d / 'diff.patch')}
         verdict_file.write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n')
         post_review(number, record, out)
@@ -410,7 +514,7 @@ def review_prompt(pr, author_family, brief, report, code_dir, diff, out):
     lines = [
         f'你是 PR 的独立评审，不是作者。作者是 {author_family} 模型族，你来自另一个模型族。只读：不改文件、不 push、不评论 PR、不合入。',
         f'用户目标和任务要求在作者收到的完整 brief：`{brief}`。先读它。',
-        f'PR：{pr["url"]}，head `{pr["headRefOid"]}`，base `{pr["baseRefName"]}`。完整 diff（对应这个 head）：`{diff}`。',
+        f'PR：{pr["url"]}，head `{pr["headRefOid"]}`，base `{pr["baseRefName"]}@{pr["baseRefOid"]}`。完整 diff（对应此快照）：`{diff}`。',
     ]
     if report and Path(report).exists():
         lines.append(f'作者报告：`{report}`。报告里的说法要对照 diff 和证据核实，不要直接采信。')
@@ -431,7 +535,7 @@ def review_prompt(pr, author_family, brief, report, code_dir, diff, out):
 
 
 def run_reviewer(reviewer, prompt, out, cwd, number):
-    if reviewer['family'] == 'claude':
+    if reviewer['runner'] == 'claude':
         tools = 'Read,Grep,Glob'
         p = subprocess.run(['claude', '-p', '--model', reviewer['model'], '--effort', reviewer['effort'],
                             '--tools', tools, '--allowedTools', tools, '--no-session-persistence',
@@ -462,7 +566,7 @@ def post_review(number, record, out):
     body = out.parent.parent / 'comment.md'
     r = record['reviewer']
     body.write_text(f'独立评审（{r["family"]} `{r["model"]}`，作者 {record["author_family"]}），'
-                    f'head `{record["head"]}`\n\n{out.read_text()}')
+                    f'head `{record["head"]}`，base `{record["base"]}@{record["base_sha"]}`\n\n{out.read_text()}')
     if run([str(SCRIPTS / 'secret-scan.sh'), str(body)], check=False).returncode:
         print('评审正文含疑似凭据，不发到 PR', file=sys.stderr)
         return
@@ -479,7 +583,7 @@ def cmd_review(a):
     pr = find_pr(state['branch']) if state.get('branch') else None
     if not pr:
         raise Refused(f'{a.name} 的分支还没有 PR')
-    review(pr['number'], state['author_family'], str(worker_dir(a.name) / 'brief.md'),
+    review(pr['number'], state.get('author_model', ''), str(worker_dir(a.name) / 'brief.md'),
            state.get('worktree'), state['out'], a.force)
 
 
@@ -492,20 +596,28 @@ def merge_gate(pr, verdict, merge_commit_bases=()):
         return False, f'没有当前 head {pr["headRefOid"][:9]} 的独立评审结论；先 dispatch review', method, all_checks
     if verdict['head'] != pr['headRefOid']:
         return False, f'评审结论对应 head {verdict["head"][:9]}，当前 head 是 {pr["headRefOid"][:9]}', method, all_checks
-    if verdict['reviewer']['family'] in (verdict['author_family'], 'tool'):
-        return False, '评审与作者同一模型族，或只有工具结论', method, all_checks
+    if verdict.get('base') != pr['baseRefName'] or not verdict.get('base_sha') or verdict['base_sha'] != pr.get('baseRefOid'):
+        return False, 'base 分支或 SHA 已改变，必须重新评审', method, all_checks
+    try:
+        author = model_family(verdict.get('author_model', ''))
+        reviewer = model_family(verdict['reviewer']['model'])
+    except Refused:
+        return False, '缺少可验证的实际模型身份，必须重新评审', method, all_checks
+    if author == reviewer or author != verdict['author_family'] or reviewer != verdict['reviewer']['family']:
+        return False, '实际模型同族或身份标签不一致', method, all_checks
     if verdict['verdict'] != 'APPROVE':
         return False, f'评审结论是 {verdict["verdict"]}，见 {verdict["review"]}', method, all_checks
     return True, f'APPROVE（{verdict["reviewer"]["family"]} {verdict["reviewer"]["model"]}，{verdict["reviewed_at"]}）', method, all_checks
 
 
 def cmd_merge(a):
-    pr = json.loads(gh('pr', 'view', str(a.pr), '--json', 'number,headRefOid,baseRefName,state').stdout)
-    verdict_file = review_dir(a.pr, pr['headRefOid']) / 'verdict.json'
+    pr = pr_view(a.pr)
+    verdict_file = review_dir(a.pr, pr['headRefOid'], pr) / 'verdict.json'
     verdict = json.loads(verdict_file.read_text()) if verdict_file.exists() else None
     ok, reason, method, all_checks = merge_gate(pr, verdict, dispatchconf.words(CONF, 'merge_commit_bases'))
     if not ok:
-        stale = sorted(p.parent.name[:9] for p in (ROOT / 'reviews' / f'pr-{a.pr}').glob('*/verdict.json'))
+        stale = sorted({p.relative_to(ROOT / 'reviews' / f'pr-{a.pr}').parts[0][:9]
+                        for p in (ROOT / 'reviews' / f'pr-{a.pr}').rglob('verdict.json')})
         raise Refused(f'合入门拒绝 PR#{a.pr}：{reason}' + (f'（已有旧 head 结论：{", ".join(stale)}）' if stale and not verdict else ''))
     print(f'合入门放行 PR#{a.pr}：{reason}；base {pr["baseRefName"]} 用 --method {method}' + (' --all-checks' if all_checks else ''), flush=True)
     script = CONF.get('merge_script')
@@ -513,35 +625,16 @@ def cmd_merge(a):
         # No project merge script: GitHub refuses the merge if the head moved after the review.
         args = ['gh', 'pr', 'merge', str(a.pr), f'--{method}', '--match-head-commit', verdict['head']]
         if a.dry_run:
-            print('would run: ' + shlex.join(args))
+            print('would run (cwd is configured repo): ' + shlex.join(args))
             return
-        run(args)
+        if snapshot(pr_view(a.pr)) != snapshot(pr):
+            raise Refused('合入前 head 或 base 已改变，必须重新评审')
+        run(args, cwd=REPO)
         notify(f'MERGED PR#{a.pr} ({method})')
         return
-    # The project's merge script, always the copy on origin/main (a branch cannot weaken its own gate).
-    run(['git', '-C', REPO, 'fetch', '-q', 'origin', 'main'])
-    mwg = ROOT / Path(script).name
-    mwg.write_text(run(['git', '-C', REPO, 'show', f'origin/main:{script}']).stdout)
-    args = ['node', str(mwg), str(a.pr), '--method', method] + (['--all-checks'] if all_checks else []) + (['--dry-run'] if a.dry_run else [])
-    heads = {verdict['head']}
-    proc = subprocess.Popen(args, cwd=REPO, stdout=subprocess.PIPE, text=True)
-    last = None
-    for line in proc.stdout:
-        print(line, end='', flush=True)
-        try:
-            last = json.loads(line)
-        except ValueError:
-            continue
-        if last.get('event') == 'updated':
-            heads.add(last['head'])  # the merge script verified it is a merge of the reviewed head and base
-        if last.get('event') == 'attempt' and last.get('head') not in heads:
-            proc.send_signal(signal.SIGTERM)
-            proc.wait()
-            raise Refused(f'合入脚本读到的 head {last["head"][:9]} 不是评审过的 head，已中止')
-    if proc.wait():
-        raise Refused(f'合入脚本未合入：{(last or {}).get("reason", "见上方输出")}')
-    if last and last.get('event') == 'merged':
-        notify(f'MERGED PR#{a.pr} ({method})')
+    # Legacy scripts may update and merge before a stdout observer can stop them.
+    # Never execute them. Update externally and re-review before using the built-in gate.
+    raise Refused('旧 merge_script 协议不支持同步授权，已禁用；update-branch 后必须重评，移除该配置后用内置 SHA 合入门')
 
 
 def cmd_adopt(a):
@@ -558,7 +651,8 @@ def cmd_adopt(a):
         if worker_dir(a.name).exists():
             raise Refused(f'{a.name} 已存在')
         save({'name': a.name, 'adopted': True, 'block': block, 'label': match[0]['label'], 'out': a.out,
-              'branch': a.branch, 'author_family': 'pi', 'timeout_min': a.timeout, 'started_at': now()})
+              'branch': a.branch, 'author_family': model_family(a.model) if a.model else None,
+              'author_model': a.model, 'timeout_min': a.timeout, 'started_at': now()})
     spawn_runner(a.name)
     print(f'adopted {a.name}: pane {block}, out {a.out}')
 
@@ -566,6 +660,8 @@ def cmd_adopt(a):
 def cmd_clean(a):
     state = load(a.name)
     d = worker_dir(a.name)
+    if state.get('local_pending') or state.get('remote_pending'):
+        raise Refused('资源创建结果不确定；状态已保留，先核对本地/远端 ref 归属，不自动删除未知资源')
     pid = alive(d / 'runner.pid')
     if pid and not a.force:
         raise Refused(f'{a.name} 的监管进程还在跑（pid {pid}）；确认放弃就加 --force')
@@ -574,15 +670,21 @@ def cmd_clean(a):
     block_file = Path(state['out'] + '.block')
     if block_file.exists():
         run(['rex', 'block', 'close', block_file.read_text().strip()], check=False)
-    own_branch = state.get('branch') and not state.get('adopted')
-    pr = find_pr(state['branch']) if own_branch else None
+    own_branch = state.get('branch') and state.get('owns_local', not state.get('adopted'))
+    pr = find_pr(state['branch']) if own_branch and state.get('owns_remote', not state.get('resumed')) else None
     if pr and pr['state'] == 'OPEN':
         raise Refused(f'PR#{pr["number"]} 还开着；先合入或关闭再 clean')
     if state.get('worktree') and Path(state['worktree']).exists():
         run(['git', '-C', REPO, 'worktree', 'remove', *(['--force'] if a.force else []), state['worktree']])
     if own_branch:
-        run(['git', '-C', REPO, 'branch', '-q', '-D', state['branch']], check=False)
-        gh('api', '-X', 'DELETE', f'repos/{{owner}}/{{repo}}/git/refs/heads/{state["branch"]}', check=False)
+        if run(['git', '-C', REPO, 'show-ref', '--verify', '--quiet', f'refs/heads/{state["branch"]}'], check=False).returncode == 0:
+            run(['git', '-C', REPO, 'branch', '-q', '-D', state['branch']])
+        if state.get('owns_remote', not state.get('resumed')):
+            remote = run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', state['branch']], check=False)
+            if remote.returncode not in (0, 2):
+                raise Refused('无法核对远端分支，保留状态以便重试 clean')
+            if remote.returncode == 0:
+                gh('api', '-X', 'DELETE', f'repos/{{owner}}/{{repo}}/git/refs/heads/{state["branch"]}')
     archive = ROOT / 'archive' / f'{a.name}-{now().replace(":", "")}'
     archive.parent.mkdir(parents=True, exist_ok=True)
     d.rename(archive)
@@ -595,9 +697,11 @@ def describe(state, prs):
     exit_info = json.loads((d / 'exit.json').read_text()) if (d / 'exit.json').exists() else None
     first = lambda p: p.read_text().splitlines()[0] if p.exists() and p.read_text().strip() else ''
     pr = prs.get(state.get('branch'))
-    reviewing = pr and alive(review_dir(pr['number'], pr['headRefOid']) / 'reviewing.pid')
+    reviewing = pr and alive(review_dir(pr['number'], pr['headRefOid'], pr) / 'reviewing.pid')
     why = ''
-    if alive(d / 'runner.pid'):
+    if state.get('phase') in ('preparing', 'failed'):
+        phase, why = state['phase'], f'启动未完成（{state.get("failure", "请检查资源后 clean 重试")}）'
+    elif alive(d / 'runner.pid'):
         if reviewing:
             phase = '评审中'
         elif Path(str(out) + '.needs-human').exists():
@@ -615,14 +719,14 @@ def describe(state, prs):
             exit_info['code'], ('异常退出', f'exit {exit_info["code"]}'))
     verdict = '-'
     if pr:
-        f = review_dir(pr['number'], pr['headRefOid']) / 'verdict.json'
+        f = review_dir(pr['number'], pr['headRefOid'], pr) / 'verdict.json'
         if f.exists():
             v = json.loads(f.read_text())
             verdict = f'{v["verdict"]}（{v["reviewer"]["family"]}）'
         elif reviewing:
             verdict = '评审中'
-        elif any((ROOT / 'reviews' / f'pr-{pr["number"]}').glob('*/verdict.json')):
-            verdict = '旧 head 的结论，需重评'
+        elif any((ROOT / 'reviews' / f'pr-{pr["number"]}').rglob('verdict.json')):
+            verdict = '旧 head/base 的结论，需重评'
         else:
             verdict = '未评审'
     started = datetime.datetime.strptime(state['started_at'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
@@ -641,7 +745,7 @@ def cmd_status(a):
     prs = {}
     if any(s.get('branch') for s in states):
         for pr in json.loads(gh('pr', 'list', '--state', 'all', '--limit', '200', '--json',
-                                'number,state,isDraft,headRefName,headRefOid,url,baseRefName').stdout):
+                                'number,state,isDraft,headRefName,headRefOid,url,baseRefName,baseRefOid').stdout):
             prs.setdefault(pr['headRefName'], pr)
     rows = [describe(s, prs) for s in states]
     if a.json:
@@ -667,8 +771,8 @@ INSTALLED = {
 }
 CONFIG_KEYS = {*REQUIRED, 'worktree_root', 'ports', 'worker_model', 'worker_thinking', 'role_brief',
                'review_checklist', 'merge_script', 'merge_commit_bases', 'card_command', 'card_env', 'card_log',
-               'protected_branches', 'temp_dirs', 'temp_containers', 'db_wrapper', 'secret_fixture_passwords'}
-SHIM_MARK = '.dotfiles/home/dispatch/'
+               'protected_branches', 'temp_dirs', 'temp_containers', 'db_wrapper', 'secret_fixture_passwords', 'approval_mode'}
+# Only exact repository links are proof of forwarding. Shell text is not proof.
 
 
 class Doctor:
@@ -691,12 +795,14 @@ def compare_dir(doc, directory):
     """Same-named files in an old scripts directory: identical, a shim, or a local change to merge back."""
     for local in sorted(Path(directory).iterdir()):
         repo = SCRIPTS / local.name
-        if not local.is_file() or not repo.is_file():
+        if not local.is_file():
             continue
-        if same_file(local, repo):
+        if not repo.is_file():
+            doc.say('WARN', 'drift', f'{local} 不在仓库里，待分类的本机 helper（请备份并检查）')
+        elif local.is_symlink() and local.resolve() == repo.resolve():
+            doc.say('OK', 'drift', f'{local} 是可验证的仓库链接')
+        elif same_file(local, repo):
             doc.say('WARN', 'drift', f'{local} 与仓库相同，是旧副本；改成薄 shim 或删除')
-        elif SHIM_MARK in local.read_text(errors='replace'):
-            doc.say('OK', 'drift', f'{local} 是指向仓库的 shim')
         else:
             doc.say('WARN', 'drift', f'{local} 与仓库不同，可能是本机独有改进：diff -u {repo} {local}')
 
@@ -768,6 +874,12 @@ def doctor_config(doc):
     if not conf:
         doc.say('FAIL', 'config', f'{p}（{source}）不存在：从 {SCRIPTS / "dispatch.config.example"} 复制并填写')
         return {}
+    try:
+        dispatchconf.approval_policy(conf)
+    except ValueError:
+        doc.say('FAIL', 'config', '自动批准策略不完整，写操作将等待人工')
+    if conf.get('merge_script'):
+        doc.say('FAIL', 'config', '旧 merge_script 协议已禁用，不能自动合入')
     doc.say('OK', 'config', f'{p}（{source}{"，链到 " + str(p.resolve()) if p.is_symlink() else ""}）')
     for key in sorted(set(conf) - CONFIG_KEYS):
         if not key.startswith('secret_pattern.'):
@@ -802,9 +914,9 @@ def doctor_deps(doc, conf):
     if conf.get('card_command'):
         needed.append(shlex.split(conf['card_command'])[0])
     try:
-        families = {reviewer_for(f)['family'] for f in ('pi', 'claude')}
+        families = {reviewer_for(f)['family'] for f in ('openai', 'anthropic')}
         doc.say('OK', 'models', f'{MODELS} 的「{REVIEW_ROLE}」可跨族评审')
-        if 'claude' in families:
+        if 'anthropic' in families:
             needed.append('claude')
     except (Refused, OSError) as e:
         doc.say('FAIL', 'models', str(e))
@@ -838,6 +950,7 @@ def main():
     s.add_argument('brief')
     s.add_argument('--base', default='main')
     s.add_argument('--branch')
+    s.add_argument('--existing-branch', action='store_true', help='续写当前 origin 仓库的已有 OPEN PR 分支')
     s.add_argument('--common')
     g = s.add_mutually_exclusive_group()
     g.add_argument('--card')
@@ -853,7 +966,7 @@ def main():
     s = sub.add_parser('review')
     s.add_argument('name', nargs='?')
     s.add_argument('--pr', type=int)
-    s.add_argument('--author', choices=['pi', 'claude'])
+    s.add_argument('--author', help='作者实际 provider/model slug，不是 runner 名')
     s.add_argument('--brief')
     s.add_argument('--worktree')
     s.add_argument('--force', action='store_true')
@@ -863,6 +976,7 @@ def main():
     s = sub.add_parser('adopt')
     s.add_argument('name')
     s.add_argument('--out', required=True)
+    s.add_argument('--model', help='已有面板的实际模型 slug；省略则不能自动评审')
     s.add_argument('--branch')
     s.add_argument('--timeout', type=int, default=180)
     s.add_argument('--force', action='store_true')

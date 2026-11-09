@@ -22,7 +22,7 @@ root = Path(tempfile.mkdtemp(prefix='DISPATCH-test-', dir='/private/tmp'))
 passed = 0
 config = root / 'dispatch.config'
 config.write_text('''protected_branches = main stack/* shared/* release/*
-temp_dirs = /tmp/ /private/tmp/ ../tmp- .tmp/
+temp_dirs = /tmp/ /private/tmp/ .tmp/
 temp_containers = tmp-
 db_wrapper = scripts/readonly-psql.sh
 secret_pattern.demo token = \\bdemo_[A-Za-z0-9_-]{20,}
@@ -106,14 +106,14 @@ elif args[:2]==['block','send']:
     proc, state, out, events, keys, log = launch('needs-human')
     try:
         check(wait_for(lambda: (state / 'calls').exists()), '启动面板')
-        (state / 'screen').write_text(ask('git push', 'git push origin main'))
+        (state / 'screen').write_text(ask('git push', 'git push origin feature/demo; git -C . push --force origin main'))
         check(wait_for(lambda: 'NEEDS HUMAN TEST' in events()), '危险确认发 NEEDS HUMAN 事件')
         time.sleep(.5)
         check(proc.poll() is None, '需人工后监管不退出')
         check(events().count('NEEDS HUMAN') == 1, '同一确认框只通知一次')
         check(keys() == '', '危险确认不按回车')
-        check(Path(str(out) + '.needs-human').read_text().startswith('git push'), '.needs-human 写原因不写命令')
-        check('origin main' not in events(), '事件不回显命令')
+        check('复合命令' in Path(str(out) + '.needs-human').read_text(), '.needs-human 写复合命令拒绝原因不写原命令')
+        check('origin main' not in events(), '事件不回显复合命令')
         (state / 'screen').write_text('─\n─')
         check(wait_for(lambda: 'RESOLVED TEST' in events()), '人工处理后发 RESOLVED 并继续监管')
         check(not Path(str(out) + '.needs-human').exists(), '处理后删除 .needs-human')
@@ -175,26 +175,28 @@ elif args[:2]==['block','send']:
     spec = importlib.util.spec_from_loader('dispatch', loader)
     dispatch = importlib.util.module_from_spec(spec); loader.exec_module(dispatch)
     head, old = 'a' * 40, 'b' * 40
-    pr = lambda base='main', state='OPEN': {'baseRefName': base, 'headRefOid': head, 'state': state}
-    v = lambda verdict='APPROVE', h=head, fam='claude', author='pi': {
-        'head': h, 'verdict': verdict, 'author_family': author, 'review': 'r.md', 'reviewed_at': 't',
-        'reviewer': {'family': fam, 'model': 'm'}}
+    pr = lambda base='main', state='OPEN': {'baseRefName': base, 'baseRefOid': old, 'headRefOid': head, 'state': state}
+    v = lambda verdict='APPROVE', h=head, fam='anthropic', author='openai', base='main': {
+        'head': h, 'base': base, 'base_sha': old, 'verdict': verdict, 'author_family': author,
+        'author_model': 'openai/gpt-6.1-sol' if author == 'openai' else 'anthropic/claude-opus-4-6',
+        'review': 'r.md', 'reviewed_at': 't',
+        'reviewer': {'family': fam, 'model': 'openai/gpt-6.1-sol' if fam == 'openai' else 'claude-opus-4-6'}}
     for name, args, ok, method in [
         ('无结论拒绝', (pr(), None), False, 'squash'),
         ('旧 head 结论拒绝', (pr(), v(h=old)), False, 'squash'),
         ('REQUEST_CHANGES 拒绝', (pr(), v('REQUEST_CHANGES')), False, 'squash'),
-        ('同族评审拒绝', (pr(), v(fam='pi')), False, 'squash'),
+        ('同族评审拒绝', (pr(), v(fam='openai')), False, 'squash'),
         ('只有工具结论拒绝', (pr(), v(fam='tool')), False, 'squash'),
         ('已关闭 PR 拒绝', (pr(state='CLOSED'), v()), False, 'squash'),
         ('main 上 APPROVE 放行，squash', (pr(), v()), True, 'squash'),
-        ('Claude 作者 + pi 评审放行', (pr(), v(fam='pi', author='claude')), True, 'squash'),
-        ('stack/* 强制 merge commit 与 all-checks', (pr('stack/identity'), v()), True, 'merge'),
+        ('Anthropic 作者 + OpenAI 评审放行', (pr(), v(fam='openai', author='anthropic')), True, 'squash'),
+        ('stack/* 强制 merge commit 与 all-checks', (pr('stack/identity'), v(base='stack/identity')), True, 'merge'),
     ]:
         allowed, reason, m, all_checks = dispatch.merge_gate(*args, ['stack/'])
         check(allowed == ok and m == method and all_checks == (method == 'merge'), f'合入门：{name}（{reason}）')
     dispatch.MODELS = Path(os.environ['ROOT']) / 'home/.claude/rules/pstack-models.md'
-    check(dispatch.reviewer_for('pi')['family'] == 'claude', 'pi 作者配 Claude 评审')
-    check(dispatch.reviewer_for('claude')['family'] == 'pi', 'Claude 作者配 pi 评审')
+    check(dispatch.reviewer_for('openai')['family'] == 'anthropic', 'OpenAI 作者配 Anthropic 评审')
+    check(dispatch.reviewer_for('anthropic')['family'] == 'openai', 'Anthropic 作者配 OpenAI 评审')
     for text, expected in [('VERDICT: APPROVE\n理由', 'APPROVE'), ('\n`VERDICT: REQUEST_CHANGES`\n', 'REQUEST_CHANGES'),
                            ('看起来不错\nVERDICT: APPROVE', None), ('VERDICT: LGTM', None)]:
         f = root / 'verdict.md'; f.write_text(text)

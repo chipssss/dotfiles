@@ -13,13 +13,15 @@ sys.path.insert(0, sys.argv.pop(1))
 import dispatchconf
 
 try:
-    conf = dispatchconf.load()
+    conf = dispatchconf.load(allow_missing=True)
     extra = [(k.split('.', 1)[1], re.compile(v.encode())) for k, v in conf.items() if k.startswith('secret_pattern.')]
 except (OSError, ValueError, re.error) as e:
     print(f'{dispatchconf.path()}:0: 配置无法读取（{type(e).__name__}）')
     sys.exit(2)
 
 PATTERNS = [
+    ('OpenAI API key', re.compile(rb'\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}')),
+    ('Anthropic API key', re.compile(rb'\bsk-ant-(?:api\d+-)?[A-Za-z0-9_-]{32,}')),
     ('带密码的 Postgres URL', re.compile(rb'postgres(?:ql)?://[^\s:@/\'"]+:(?P<pw>[^\s@/\'"]+)@(?P<host>\[[^\]]+\]|[^\s:/\'"]*)')),
     ('JWT', re.compile(rb'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])')),
     ('GitHub 令牌', re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})')),

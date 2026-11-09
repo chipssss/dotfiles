@@ -1,13 +1,11 @@
 #!/bin/sh
-# Shared by pi-worker (also via dispatch). 0 = safe, 1 = needs human, 2 = incomplete dialog.
-# Never print the command: confirmation text can contain credentials.
-# Needs $PI_SCRIPTS (for dispatchconf.py). Project values come from dispatch.config:
-# protected_branches, temp_dirs, temp_containers, db_wrapper (see dispatch.config.example).
+# 0 = safe, 1 = needs human, 2 = incomplete dialog. Never echo command text.
 safe_ask() {
-  # shellcheck disable=SC2034 # Read by the callers, never includes command text.
-  if APPROVAL_REASON=$(PI_APPROVAL_TEXT="$1" python3 - <<'PY'
+  # shellcheck disable=SC2034 # Fixed reason consumed by the supervisor, never command text.
+  if APPROVAL_REASON=$(PI_APPROVAL_TEXT="$1" python3 -B - <<'PY'
 import fnmatch
 import os
+from pathlib import Path
 import re
 import shlex
 import subprocess
@@ -27,85 +25,47 @@ if not menu:
     print('等待完整确认对话')
     sys.exit(2)
 
+
 def deny(reason):
     print(reason)
     sys.exit(1)
 
+
 try:
     conf = dispatchconf.load()
+    dispatchconf.approval_policy(conf)
 except (OSError, ValueError):
-    deny('dispatch 配置无法读取')
-PROTECTED = dispatchconf.words(conf, 'protected_branches', 'main master')
-TEMP_DIRS = tuple(dispatchconf.words(conf, 'temp_dirs', '/tmp/ /private/tmp/ .tmp/'))
+    deny('dispatch 配置缺失或策略不完整，需要人工确认')
+PROTECTED = ['main', 'master', *dispatchconf.words(conf, 'protected_branches')]
 TEMP_CONTAINERS = tuple(dispatchconf.words(conf, 'temp_containers'))
 DB_WRAPPER = conf.get('db_wrapper', '')
-
 match = re.search(r'Allow ([^?]+)\?', text)
 if not match:
     deny('无法识别确认类型')
 kind = match[1]
-# Pi's ExtensionSelector renders a distinct ↑↓ navigate footer.
-command = text[match.end():menu.start()]
-# The pane soft-wraps long commands; a wrap between `git` and `push` is not a command boundary.
-command = re.sub(r'\bgit[ \t]*\n[ \t]*push\b', 'git push', command)
+command = text[match.end():menu.start()].strip()
+# A capture is not a shell AST. Do not guess at soft wrapping, nested shells,
+# expansions, redirects or compound commands. Each needs human authorization.
+if re.search(r'\b(?:ps|pgrep)\b', command):
+    deny('进程命令行查询需要人工确认')
+if re.search(r'(?<![\w-])psql(?:\s|$)', command):
+    deny(f'请改用 {DB_WRAPPER}' if DB_WRAPPER else '数据库命令需要人工确认')
+if any(c in command for c in '\n\r;&|<>$`()\\'):
+    deny('复合命令、展开或重定向需要人工确认')
 try:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|<>\n')
-    lexer.whitespace = ' \t\r'  # Preserve newlines as shell command boundaries.
-    lexer.whitespace_split = True
-    lexer.commenters = '#'
-    tokens = list(lexer)
+    words = shlex.split(command, comments=False)
 except ValueError:
     deny('命令不完整或引号无法解析')
-segments, part = [], []
-for token in tokens + [';']:
-    if re.fullmatch(r'[;&|<>\n]+', token):
-        if part:
-            segments.append(part)
-            part = []
-    else:
-        part.append(token)
-
-# Include quoted shell payloads and terminal soft wraps, not just top-level commands.
-def check_process_queries(words):
-    for i, word in enumerate(words):
-        executable = word.rsplit('/', 1)[-1]
-        if executable == 'ps':
-            deny('进程命令行查询被拒绝；请用 lsof -t 或 pgrep -x 查询 PID')
-        if executable == 'pgrep' and any(
-            arg in ('--full', '--list-full') or arg.startswith('--full=')
-            or (arg.startswith('-') and not arg.startswith('--') and any(flag in arg for flag in 'fa'))
-            for arg in words[i+1:]
-        ):
-            deny('进程命令行匹配被拒绝；请用 pgrep -x 查询 PID')
-        if any(c.isspace() for c in word):
-            try:
-                nested = shlex.split(word)
-            except ValueError:
-                continue
-            if len(nested) > 1:
-                check_process_queries(nested)
-
-for part in segments:
-    check_process_queries(part)
-try:
-    check_process_queries(shlex.split(command.replace('\n', ' '), comments=True))
-except ValueError:
-    deny('命令不完整或引号无法解析')
-
-# db_wrapper names the one script allowed to reach a database with credentials.
-wrapper_re = r'(?:.*/)?' + re.escape(DB_WRAPPER) if DB_WRAPPER else None
-wrapper = wrapper_re and any(
-    re.fullmatch(wrapper_re, p[0])
-    or (p[0] in ('sh', 'bash') and len(p) > 1 and re.fullmatch(wrapper_re, p[1]))
-    for p in segments
-)
-risky_psql = re.search(r'\bpsql\b', command) and re.search(
-    r'\bop\s+read\b|DATABASE_URL|postgres(?:ql)?://', command)
-# Merely mentioning the wrapper (or invoking it alongside raw psql) is not a bypass.
-raw_psql = re.search(r'\bpsql\b', re.sub(r'(?:[^\s;|&]*/)?' + re.escape(DB_WRAPPER), '', command)
-                     if DB_WRAPPER else command)
-if risky_psql and (not wrapper or raw_psql):
-    deny(f'请改用 {DB_WRAPPER}' if DB_WRAPPER else '带凭据的数据库命令需要人工确认')
+if not words:
+    deny('没有命令')
+# Only known executable spellings, not arbitrary same-basename programs.
+exe = words[0]
+if exe in ('/bin/rm', '/usr/bin/rm'):
+    exe = 'rm'
+if exe in ('/usr/bin/git', '/bin/git'):
+    exe = 'git'
+args = words[1:]
+cwd = os.environ.get('PI_APPROVE_CWD')
 
 
 def protected(ref):
@@ -113,112 +73,130 @@ def protected(ref):
     return any(fnmatch.fnmatchcase(ref, pattern) for pattern in PROTECTED)
 
 
-def branches_safe(cwd, upstream_matters=True):
-    if not cwd or not os.path.isabs(cwd) or any(c in cwd for c in '$`\n'):
-        deny('裸 git push 缺少可验证的 cd <dir>')
+def branches_safe(upstream_matters=True):
+    if not cwd or not os.path.isabs(cwd):
+        deny('裸 git push 缺少可验证的工作目录')
     try:
         def git(*args):
-            return subprocess.check_output(
-                ['git', '-C', cwd, 'rev-parse', '--abbrev-ref', *args],
-                stderr=subprocess.DEVNULL, text=True, timeout=3).strip()
-        head = git('HEAD')
-        if not upstream_matters:
-            # `git push <remote> HEAD` writes the same-named branch whatever the upstream is.
-            if head == 'HEAD' or protected(head):
-                deny('git push HEAD 的当前分支是共享分支')
-            return
-        upstream = git('@{u}')
-        remote = subprocess.check_output(
-            ['git', '-C', cwd, 'config', '--get', f'branch.{head}.remote'],
-            stderr=subprocess.DEVNULL, text=True, timeout=3).strip()
+            return subprocess.check_output(['git', '-C', cwd, *args], stderr=subprocess.DEVNULL,
+                                           text=True, timeout=3).strip()
+        head = git('rev-parse', '--abbrev-ref', 'HEAD')
+        if head == 'HEAD' or protected(head):
+            deny('当前分支是共享分支')
+        if upstream_matters:
+            upstream = git('rev-parse', '--abbrev-ref', '@{u}')
+            remote = git('config', '--get', f'branch.{head}.remote')
+            upstream = upstream.removeprefix(remote + '/') if remote != '.' else upstream
+            if protected(upstream):
+                deny('上游是共享分支')
     except (subprocess.SubprocessError, OSError):
-        deny('裸 git push 无法读取当前分支或上游')
-    upstream = upstream.removeprefix(remote + '/') if remote != '.' else upstream
-    if head == 'HEAD' or protected(head) or protected(upstream):
-        deny('裸 git push 的当前分支或上游是共享分支')
+        deny('无法读取当前分支或上游')
 
 
-# A terminal soft wrap is indistinguishable from a shell newline in a capture.
-# Check shared targets/force flags with newlines folded too, before the bare-push check.
-for continuation in re.findall(r'\bgit\s+push\b([^;&|<>]*)', command):
-    try:
-        folded_args = shlex.split(continuation)
-    except ValueError:
-        deny('换行 push 命令无法解析')
-    if any(a.startswith(('--force', '+', ':')) or a in ('-f', '--delete', '-d')
-           or protected(a.rsplit(':', 1)[-1]) for a in folded_args):
-        deny('git push 包含共享目标、强推或删除')
-
-pushes = []
-# pi-worker exports the pane's working directory; pi starts every command there.
-cwd = os.environ.get('PI_APPROVE_CWD') or None
-for p in segments:
-    if p[0] == 'cd':
-        cwd = p[1] if len(p) == 2 else None
-    for i in range(len(p) - 1):
-        if p[i:i+2] != ['git', 'push']:
-            continue
-        args = p[i+2:]
-        if any(a.startswith('--force') or a in ('-f', '--delete', '-d')
-               or a.startswith('+') or (a.startswith('-') and a not in ('-u', '--set-upstream'))
-               for a in args):
-            deny('git push 包含强推、删除或不支持的选项')
-        args = [a for a in args if a not in ('-u', '--set-upstream')]
-        if not args or len(args) == 1:
-            branches_safe(cwd)
-        else:
-            # A URL can hide credentials and push configuration; only named remotes.
-            if not re.fullmatch(r'[A-Za-z0-9_.-]+', args[0]):
-                deny('git push 的 remote 无法验证')
-            for ref in args[1:]:
-                dest = ref.split(':', 1)[-1]
-                if not dest or ref.startswith(':') or protected(dest):
-                    deny('git push 的目标是共享分支或删除 refspec')
-                if ref == 'HEAD':
-                    branches_safe(cwd, upstream_matters=False)
-                elif dest == 'HEAD':
-                    branches_safe(cwd)
-                elif not re.fullmatch(r'(?:refs/heads/)?[A-Za-z0-9_./-]+', dest):
-                    deny('git push 的 refspec 无法验证')
-        pushes.append(p)
-
-if kind == 'git push' and pushes:
+if kind == 'git push' and exe == 'git' and args[:1] == ['push']:
+    args = args[1:]
+    if any(a.startswith(('--force', '+', ':')) or
+           (a.startswith('-') and a not in ('-u', '--set-upstream')) for a in args):
+        deny('git push 包含强推、删除或不支持的选项')
+    args = [a for a in args if a not in ('-u', '--set-upstream')]
+    if args and not re.fullmatch(r'[A-Za-z0-9_.-]+', args[0]):
+        deny('remote 无法验证')
+    if len(args) < 2:
+        branches_safe()
+    else:
+        for ref in args[1:]:
+            if ref.count(':') > 1:
+                deny('refspec 无法验证')
+            dest = ref.split(':', 1)[-1]
+            if not re.fullmatch(r'(?:refs/heads/)?[A-Za-z0-9_./-]+', dest) or protected(dest):
+                deny('目标是共享分支或无法验证')
+            if ref == 'HEAD':
+                branches_safe(False)
+            elif dest == 'HEAD':
+                branches_safe()
     print('功能分支 push')
     sys.exit(0)
-if kind == 'GitHub pull-request mutation':
-    if re.search(r'pr\s+(?:merge|close)|--admin|merge-when-green|pulls/[0-9]+/merge|--delete-branch', command):
-        deny('PR 合并或关闭需要人工确认')
-    print('PR 创建或编辑')
-    sys.exit(0)
-if kind == 'recursive deletion':
-    found = False
-    for p in segments:
-        for i, word in enumerate(p):
-            if word != 'rm':
+
+
+def inside(path, root):
+    return path != root and root in path.parents
+
+
+def temporary(target):
+    if any(c in target for c in '~*?[]{}'):
+        return False
+    raw = Path(target)
+    if not raw.is_absolute():
+        if not cwd or not os.path.isabs(cwd):
+            return False
+        raw = Path(cwd) / raw
+    # Reject traversal even if the final resolution returns to a temporary root.
+    if '..' in raw.parts:
+        return False
+    roots = []
+    for root in dispatchconf.words(conf, 'temp_dirs', '/tmp/ /private/tmp/ .tmp/'):
+        p = Path(root)
+        if not p.is_absolute():
+            if not cwd or root != '.tmp/':
                 continue
-            args = p[i+1:]
-            targets = [a for a in args if not a.startswith('-')]
-            if not targets:
-                deny('无法解析删除目标')
-            if i > 0 and p[i-1] == 'docker':
-                if not TEMP_CONTAINERS or not all(
-                        re.fullmatch(r'[A-Za-z0-9_.-]+', t) and t.startswith(TEMP_CONTAINERS) for t in targets):
-                    deny('只自动允许配置的临时容器')
+            p = Path(cwd).resolve() / '.tmp'
+            if p.is_symlink():
+                continue
+        resolved_root = p.resolve()
+        system_tmp = Path('/tmp').resolve()
+        if root != '.tmp/' and resolved_root != system_tmp and not inside(resolved_root, system_tmp):
+            continue
+        roots.append(resolved_root)
+    try:
+        canonical = raw.resolve()
+        if not any(inside(canonical, root) for root in roots):
+            return False
+        # realpath alone misses an escape followed by a return into tmp.
+        current = Path(raw.anchor)
+        for component in raw.parts[1:]:
+            current /= component
+            if current.is_symlink():
+                if not current.exists():
+                    return False
+                resolved = current.resolve(strict=True)
+                if not any(resolved == root or inside(resolved, root) for root in roots):
+                    return False
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+if kind == 'recursive deletion':
+    if exe == 'rm':
+        targets = []
+        options = True
+        for arg in args:
+            if options and arg == '--':
+                options = False
+            elif options and arg.startswith('-'):
+                if not re.fullmatch(r'-[rfRv]+|--recursive|--force', arg):
+                    deny('不支持的 rm 选项')
             else:
-                for target in targets:
-                    normalized = os.path.normpath(target)
-                    if any(c in target for c in '$`*?[]{}') or not (
-                        normalized.startswith(TEMP_DIRS)
-                    ):
-                        deny('删除目标不是允许的临时目录')
-            found = True
-    if found:
-        print('临时目录或临时容器删除')
+                targets.append(arg)
+        if targets and all(temporary(t) for t in targets):
+            print('允许根内的临时目录删除')
+            sys.exit(0)
+    elif exe == 'docker' and args[:1] == ['rm']:
+        targets = [a for a in args[1:] if not a.startswith('-')]
+        flags = [a for a in args[1:] if a.startswith('-')]
+        if targets and TEMP_CONTAINERS and all(re.fullmatch(r'-[fv]+', f) for f in flags) and all(
+                re.fullmatch(r'[A-Za-z0-9_.-]+', t) and t.startswith(TEMP_CONTAINERS) for t in targets):
+            print('临时容器删除')
+            sys.exit(0)
+# PR bodies may contain shell metacharacters, so those requests conservatively wait too.
+if kind == 'GitHub pull-request mutation' and exe == 'gh' and args[:2] in (['pr', 'create'], ['pr', 'edit']):
+    if '--delete-branch' not in args and '--admin' not in args:
+        print('PR 创建或编辑')
         sys.exit(0)
-if risky_psql and wrapper and not raw_psql:
-    print('数据库包装脚本')
+if DB_WRAPPER and words[0] == DB_WRAPPER:
+    print('配置的数据库包装脚本')
     sys.exit(0)
-deny('此操作不在自动审批范围内')
+deny('此操作不在简单命令自动审批范围内')
 PY
   ); then
     return 0

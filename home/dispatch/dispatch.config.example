@@ -21,10 +21,10 @@ evidence_dir = ~/code/example-notes/evidence
 # role_brief = ~/code/example-notes/briefs/worker-role.md
 # review_checklist = ~/code/example-notes/briefs/review-checklist.md
 
-# Optional merge script, read from origin/main of repo. It takes
-# `PR --method squash|merge [--all-checks] [--dry-run]` and prints JSON lines with
-# `attempt`/`updated`/`merged` events carrying `head`. Without it, dispatch merge runs
-# `gh pr merge --squash --match-head-commit <reviewed head>`.
+# Legacy merge scripts are disabled: stdout events cannot authorize a merge synchronously.
+# A nonempty merge_script makes dispatch merge refuse without launching the script.
+# Update branches separately, re-review the new head/base snapshot, and remove this setting
+# to use `gh pr merge --match-head-commit <reviewed head>` in the configured repo.
 # merge_script = scripts/merge.mjs
 # Base-branch prefixes that keep a merge commit and wait for all checks.
 # merge_commit_bases = stack/
@@ -36,9 +36,15 @@ evidence_dir = ~/code/example-notes/evidence
 # card_log = ~/code/example-notes/cards.txt
 
 # Approval rules for pi confirmations (pi-worker reads this file too).
-# Pushes to these branches (fnmatch patterns, e.g. release/*) always wait for a human.
-# protected_branches = main master
-# Recursive deletes under these prefixes are auto-approved.
+# Missing config, unknown keys and incomplete project policy fail closed.
+# Project mode requires this nonempty list. main/master are always added, never replaced.
+# Add ALL shared project branch patterns here (fnmatch, e.g. release/*).
+protected_branches = main master
+# Optional explicit project-independent mode. It cannot know project shared branches.
+# approval_mode = generic
+# Only recognized simple commands can be approved; compounds/redirects/expansions wait.
+# Canonical temporary roots, never arbitrary string prefixes. Root deletion is refused.
+# Each target and symlink component must stay inside the roots; .tmp itself cannot be a symlink.
 # temp_dirs = /tmp/ /private/tmp/ .tmp/
 # `docker rm` of containers with these name prefixes is auto-approved (none by default).
 # temp_containers = tmp-

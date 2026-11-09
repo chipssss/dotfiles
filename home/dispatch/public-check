@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Read-only public payload check: diff, messages, author/committer identities and PR body.
+
+Use --pr-body FILE for a prepared body, or --pr N to fetch the current body.
+Only public GitHub noreply identities are accepted for newly published commits.
+Patterns are intentionally finite; this is not proof that arbitrary data is non-secret.
+"""
+import argparse
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--repo', default='.')
+    ap.add_argument('--base', required=True)
+    ap.add_argument('--head', default='HEAD')
+    body = ap.add_mutually_exclusive_group(required=True)
+    body.add_argument('--pr-body', type=Path)
+    body.add_argument('--pr', type=int)
+    a = ap.parse_args()
+
+    def command(args):
+        return subprocess.check_output(args, cwd=a.repo, stderr=subprocess.DEVNULL)
+
+    def git(*args):
+        return command(['git', *args])
+
+    try:
+        base = git('rev-parse', '--verify', a.base + '^{commit}').decode().strip()
+        head = git('rev-parse', '--verify', a.head + '^{commit}').decode().strip()
+        identities = git('log', '--format=%ae%x00%ce', f'{base}..{head}').splitlines()
+        bad_identity = any(not re.fullmatch(rb'(?:\d+\+)?[A-Za-z0-9-]+@users\.noreply\.github\.com', email)
+                           for line in identities for email in line.split(b'\0'))
+        payloads = {
+            'diff': git('diff', '--no-ext-diff', '--no-textconv', '--binary', f'{base}...{head}'),
+            'messages': git('log', '--format=%B', f'{base}..{head}'),
+            'identities': git('log', '--format=%an <%ae>%n%cn <%ce>', f'{base}..{head}'),
+            'pr-body': a.pr_body.read_bytes() if a.pr_body else command(['gh', 'pr', 'view', str(a.pr), '--json', 'body', '--jq', '.body']),
+        }
+        hits = int(bad_identity)
+        if bad_identity:
+            print('identities: non-noreply identity; values withheld')
+        privacy = re.compile(rb'(?:/' + b'Users' + rb'/[^\s/\x27\x22]+/|[A-Za-z0-9_-]+\.local\b)')
+        with tempfile.TemporaryDirectory(prefix='dispatch-public-') as directory:
+            paths = []
+            for label, data in payloads.items():
+                path = Path(directory) / label
+                path.write_bytes(data)
+                paths.append(str(path))
+                if privacy.search(data):
+                    print(f'{label}: local path or hostname; values withheld')
+                    hits += 1
+            scan = subprocess.run(['sh', str(Path(__file__).resolve().parent / 'secret-scan.sh'), *paths],
+                                  capture_output=True, text=True)
+            # Scanner reports only location and category, never the value.
+            if scan.stdout:
+                print(scan.stdout, end='')
+            if scan.returncode == 2:
+                return 2
+            hits += scan.returncode != 0
+        if not hits:
+            print('PASS: diff, commit messages, author/committer identities, PR body')
+        return 1 if hits else 0
+    except (OSError, subprocess.SubprocessError):
+        print('Public check could not read the complete payload; values withheld', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
