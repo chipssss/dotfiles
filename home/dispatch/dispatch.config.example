@@ -17,12 +17,17 @@ ports = 3110-3999
 
 # Optional extra Python regex patterns. Scanner output never contains matched values.
 # secret_pattern.example-token = \bexample_[A-Za-z0-9]{20,}
-# Password whitelist for exact loopback hosts (default shown below).
-# Other loopback passwords are flagged, including numeric-port SSH tunnels,
-# unless the port itself is a complete ${{ ... }} CI template expression.
-# Multiple @ delimiters or comma-separated hosts never receive an exemption.
-# A host= or hostaddr= query parameter (case-insensitive) disables both loopback
-# exemptions; harmless query parameters do not change them.
-# An empty list disables only the password-based exemption. Changes also affect
-# doctor's effective-config fingerprint.
+# Password whitelist (default below). A loopback exemption first requires:
+# <scheme>://user:password@HOST[:PORT]/DBNAME[?QUERY], then whitespace, a quote or EOL.
+# HOST: exactly localhost, 127.0.0.1 or [::1], case-insensitive; bare ::1 is flagged.
+# PORT: digits or one complete, nonempty ${{ ... }} expression, no internal }}.
+# DBNAME: required, [A-Za-z0-9_-]+ only; no templates, percent escapes or slashes.
+# QUERY: name=value pairs joined by &, names literally sslmode, application_name
+# or connect_timeout (lowercase), values [A-Za-z0-9_.-]* only (possibly empty).
+# Other names, %, #, extra @, multi-host lists and non-boundary suffixes are flagged.
+# The password must ALSO be in this list, OR the port must be the CI expression.
+# Numeric-port SSH tunnels with other passwords are flagged. An empty list only
+# disables password-based exemptions. Changes affect doctor's config fingerprint.
+# The existing reserved .invalid fixture exemption is unchanged.
+# See README.md for the full URL contract and CI service-container example.
 secret_fixture_passwords = postgres synthetic

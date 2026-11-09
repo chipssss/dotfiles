@@ -308,12 +308,18 @@ elif args[:2]==['block','send']:
         'postgres://fixture:synthetic@localhost/test\npostgres://fixture:anything@host.invalid/db\n'
         'redis://fixture:synthetic@127.0.0.1/test\nmysql://fixture:synthetic@[::1]/test\n'
         'https://fixture:anything@host.invalid/test\nredis://localhost/test\n'
-        'https://user@example.com/path\nnot-a-private-key\n'
-        'redis://:synthetic@localhost/0\nredis://:anything@host.invalid/0\n'
-        'redis://:@cache.example.com/0\n')
+        'https://user@example.com/path\nnot-a-private-key\n')
     for args, expected in [([str(out.parent)], 0), ([], 2), ([str(out.parent/'missing')], 2)]:
         scan=subprocess.run(['sh', str(scripts/'secret-scan.sh'), *args], capture_output=True, text=True)
         check(scan.returncode==expected, '共用扫描器干净/用法/缺文件退出码 '+str(expected))
+    # Build synthetic fixtures without embedding credential-shaped source lines.
+    (out.parent/'empty-user-fixtures.txt').write_text('\n'.join([
+        'redis://' + ':synthetic@localhost/0',
+        'redis://' + ':anything@host.invalid/0',
+        'redis://' + ':@cache.example.com/0',
+    ]) + '\n')
+    scan=subprocess.run(['sh', str(scripts/'secret-scan.sh'), str(out.parent)], capture_output=True, text=True)
+    check(scan.returncode==0 and not scan.stdout and not scan.stderr, '空用户名 fixture 与空密码不误报')
     (out.parent/'external').symlink_to(out)
     Path(str(out)+'.done').write_text('done')
     env['FAKE_NO_DONE']='1'

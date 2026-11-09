@@ -133,18 +133,40 @@ The credential scanner checks OpenAI/Anthropic API key shapes, GitHub tokens,
 three-part JWT-shaped strings, and generic
 `scheme://user:password@host.invalid/path`-shaped URLs, including empty usernames
 such as `redis://:password@host.invalid/0` and nested/binary output. Password URLs
-on reserved `.invalid` fixture hosts are exempt. Exact loopback hosts
-(`localhost`, `127.0.0.1`, `::1`, `[::1]`) are exempt only when the password is in
-`secret_fixture_passwords` (default: `postgres synthetic`), or the port itself is
-a complete `${{ ... }}` CI template expression. An explicit empty password list
-disables the password-based exemption, not the CI-port exemption. Numeric-port
-loopback URLs with other passwords are flagged, including SSH tunnel URLs.
-Lookalikes such as `127.0.0.1.evil.com` and `localhost.example`, multiple `@`
-delimiters, and comma-separated libpq hosts never receive a host exemption.
-A `host=` or `hostaddr=` query parameter (case-insensitive, after `?` or `&`)
-disables both loopback exemptions, even for an empty or loopback value. Other
-parameters such as `sslmode` and `application_name` do not affect exemptions;
-queries on later URLs on the same line are checked independently.
+on reserved `.invalid` fixture hosts retain their existing exemption. Loopback
+exemptions instead require the **entire URL** to match this allowlisted shape:
+
+```text
+<scheme>://user:password@HOST[:PORT]/DBNAME[?QUERY]
+```
+
+- `HOST` is exactly `localhost`, `127.0.0.1`, or `[::1]` (case-insensitive).
+  Bare `::1` is deliberately not exempt. Usernames may be empty; userinfo cannot
+  contain an extra `@`.
+- `PORT`, if present, is digits only or one complete, nonempty `${{ ... }}` CI
+  expression. The expression is not evaluated, cannot contain an internal `}}`,
+  and may contain spaces and quotes. No concatenated templates or trailing text.
+- `DBNAME` is required and contains only `[A-Za-z0-9_-]+`, never templates,
+  percent escapes, or extra slashes.
+- Optional `QUERY` is `name=value` pairs joined by `&`. Names are the literal,
+  lowercase `sslmode`, `application_name`, or `connect_timeout`; values contain
+  only `[A-Za-z0-9_.-]*` (empty values are allowed). No other names, percent
+  escapes, `#`, extra `=`, or semicolons are exempt.
+- The complete URL must end at whitespace, a single/double quote, or end of line.
+  In particular, `#`, `@`, `,`, `;`, and backslash are not URL terminators.
+  A later URL on the same line is checked independently.
+
+Even with this shape, the password must be in `secret_fixture_passwords`
+(default: `postgres synthetic`), **or** the port must be the CI expression above.
+An explicit empty password list disables only the password-based exemption.
+All other detected password URLs are reported, including numeric-port SSH tunnel
+passwords, host lookalikes, multiple hosts, encoded query names, and path templates.
+For example, the CI shape below is exempt with or without `?sslmode=disable`:
+
+```yaml
+TEST_DATABASE_URL: postgresql://postgres:<pw>@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/app_test
+```
+
 Whitelist changes affect both scanner behavior and doctor's effective-config
 fingerprint. URLs without a password are not flagged by this rule.
 It prints locations/categories, never matched values. These patterns and custom

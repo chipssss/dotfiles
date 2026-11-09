@@ -5,6 +5,7 @@ set -eu
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 export ROOT
 exec python3 -B - <<'PY'
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -18,15 +19,34 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
     env = dict(os.environ, DISPATCH_CONFIG=str(config))
     artifact = root / 'artifact'
     # Synthetic service-container URL with a redacted password and CI port expression.
-    artifact.write_text("TEST_DATABASE_URL: postgresql://postgres:<pw>@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/app_test\n")
+    artifact.write_text("TEST_DATABASE_URL: postgresql://postgres:<pw>@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/app_test" + '\n')
     scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
     assert scan.returncode == 0 and not scan.stdout and not scan.stderr, 'CI loopback URL must not be reported as a credential'
     print('PASS: redacted CI loopback URL is clean', flush=True)
 
-    passed = 1
-    def check_url(host, port, expected, user='postgres', scheme='postgresql', password='<pw>', query=''):
+    # Replay all three review rounds through the public CLI. Expectations come
+    # from the whole-URL contract, not from the scanner's matching expressions.
+    corpus = json.loads((Path(os.environ['ROOT']) / 'tests/dispatch-secret-scan-review.json').read_text())
+    failures = []
+    for label, expected, content in corpus['cases']:
+        artifact.write_text(content)
+        scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
+        if scan.returncode != expected:
+            failures.append(f'{label}: expected {expected}, got {scan.returncode}')
+        assert not scan.stderr, f'{label}: unexpected scan error'
+        # Only positions and kinds may be printed, including multiline inputs.
+        for finding in scan.stdout.splitlines():
+            position, kind = finding.rsplit(': ', 1)
+            path, line = position.rsplit(':', 1)
+            assert path == str(artifact) and line.isdigit() and kind in ('带密码的 URL', '私钥'), label
+        assert bool(scan.stdout) == (scan.returncode == 1), label
+    assert not failures, 'review corpus mismatches:\n' + '\n'.join(failures)
+    print(f"PASS: {len(corpus['cases'])} review corpus cases", flush=True)
+
+    passed = 1 + len(corpus['cases'])
+    def check_url(host, port, expected, user='postgres', scheme='postgresql', password='<pw>', query='', dbname='app_test'):
         global passed
-        url = f'{scheme}://{user}:{password}@{host}{port}/app_test{query}'
+        url = f'{scheme}://{user}:{password}@{host}{port}/{dbname}{query}'
         artifact.write_text('TEST_DATABASE_URL: ' + url + '\n')
         scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
         assert scan.returncode == expected, f'{host}, {port!r}, {query!r}: expected {expected}, got {scan.returncode}'
@@ -67,15 +87,15 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
 
     # Exact loopbacks need a fixture password OR a complete CI port expression.
     ports = ['', ':5432', ":${{ job.services.postgres.ports['5432'] }}"]
-    loopbacks = ['127.0.0.1', '::1', '[::1]', 'localhost', 'LOCALHOST']
+    loopbacks = ['127.0.0.1', '[::1]', 'localhost', 'LOCALHOST']
     for host in loopbacks:
         for port in ports:
             for user in ['postgres', '']:
                 check_url(host, port, 0 if port == ports[2] else 1, user=user)
                 check_url(host, port, 0, user=user, password='synthetic')
 
-    # Both loopback exemptions reject target overrides, even empty/local values.
-    # Names are case-insensitive and can follow either ? or & in the query.
+    # Only literal safe query names and simple values are exempt. Everything
+    # outside the allowlisted DB/query shape is reported, not just target keys.
     target_queries = [
         '?host=db.prod.example.com',
         '?hostaddr=203.0.113.7',
@@ -84,13 +104,21 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
         '?HOST=db.prod.example.com',
         '?application_name=probe&HoStAdDr=203.0.113.7',
         '?host=', '?hostaddr=', '?host=localhost',
-    ]
-    harmless_queries = [
-        '?sslmode=disable', '?application_name=hostx',
         '?application_name=host=db.prod.example.com',
         '?myhost=db.prod.example.com', '?hostaddress=203.0.113.7',
         '/host=db.prod.example.com', '/&host=db.prod.example.com',
         '#?host=db.prod.example.com', '?sslmode=disable#&host=db.prod.example.com',
+        '?h%6Fst=db.prod.example.com', '?%68ost%61ddr=203.0.113.7',
+        '?sslmode=disable;host=db.prod.example.com',
+        '?SSLMODE=disable', '?application%5Fname=ci', '?sslmode=%64isable',
+        '?sslmode=disable&', '?sslmode=disable&&connect_timeout=1',
+        '?sslmode', '?', '?application_name=a/b', '?application_name=${{ env.NAME }}',
+    ]
+    harmless_queries = [
+        '?sslmode=disable', '?application_name=hostx', '?connect_timeout=10',
+        '?sslmode=disable&application_name=ci&connect_timeout=1',
+        '?application_name=probe_1.2-3', '?application_name=',
+        '?connect_timeout=&sslmode=', '?sslmode=disable&sslmode=require',
     ]
     for host in loopbacks:
         for port, password in [('', 'synthetic'), (':5432', 'postgres'),
@@ -99,6 +127,22 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
                 check_url(host, port, 1, password=password, query=query)
             for query in harmless_queries:
                 check_url(host, port, 0, password=password, query=query)
+
+    # DB names and URL terminators are part of the whitelist. Bare ::1 is
+    # deliberately rejected; bracketed IPv6 is the only IPv6 fixture shape.
+    for port, password in [('', 'synthetic'), (':5432', 'postgres'), (ports[2], '<pw>')]:
+        for dbname in ['', '.', 'app.test', 'app%5Ftest', 'app/test', '${{ env.DB_NAME }}']:
+            check_url('localhost', port, 1, password=password, dbname=dbname)
+        check_url('LOCALHOST', port, 0, password=password, dbname='DB-1_2')
+        check_url('::1', port, 1, password=password)
+        for tail in ['#', '@', ',', ';', '\\', '.', '/', '%20', '?sslmode=disable#',
+                     '/${{ env.DB_NAME }}?host=db.example.com']:
+            check_url('localhost', port, 1, password=password, query=tail)
+    for port in [':', ':abc', ':12x', ':${{ ports.db }}${{ ports.other }}',
+                 ':${{ ports.db }}evil', ':${{ }}', ':${{ a}}b }}']:
+        check_url('localhost', port, 1, password='synthetic')
+    check_url('127.0.0.1', ports[2], 0, query='?sslmode=disable')
+    check_url('localhost', ':0005432', 0, password='synthetic')
 
     # A following URL's query cannot revoke the first URL's exemption.
     later_target = 'postgresql://' + 'db.example.com/app_test?host=db.prod.example.com'
@@ -128,11 +172,11 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
                 check_url(host, port, 1, user=user)
                 check_url(host, port, 1, user=user, password='synthetic')
 
-    # Encoded fixture lines can share a source-code line, but not an authority.
+    # A literal backslash is not a URL boundary, even for encoded newlines.
     fixture_url = 'redis://' + ':synthetic@localhost/0'
     remote_url = 'redis://' + ':<pw>@cache.example.com/0'
     for content, expected in [
-        ('\\n'.join([fixture_url, fixture_url]), 0),
+        ('\\n'.join([fixture_url, fixture_url]), 1),
         ('\\n'.join([fixture_url, remote_url]), 1),
         ('"' + 'postgresql://' + 'user:<pw>@127.0.0.1:15432/app_test' + '"', 1),
         ('redis://' + ':synthetic@localhost:5432\\n@db.example.com/0', 1),

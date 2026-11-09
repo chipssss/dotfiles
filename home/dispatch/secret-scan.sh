@@ -35,37 +35,36 @@ PATTERNS = [
     ('GitHub 令牌', re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})')),
 ] + extra
 
-# Inspect the rest of the authority, not paths or later URLs on the same line.
-# CI expressions may contain spaces and quotes; keep them as opaque port text.
-# Reject ambiguous targets before applying any host exemption.
-URL_SUFFIX = re.compile(rb'(?:\$\{\{[^\r\n]*?\}\}|[^\s/\?#\'\"])*')
+# This legacy .invalid exemption is intentionally unchanged. Its authority
+# check is not used for loopbacks; those must match the entire safe URL shape.
+INVALID_SUFFIX = re.compile(rb'(?:\$\{\{[^\r\n]*?\}\}|[^\s/\?#\'\"])*')
 
-CI_PORT = re.compile(rb':\$\{\{(?P<expression>(?:(?!\}\})[^\r\n])*)\}\}(?=[/?#]|$)')
+# Do not try to enumerate libpq target overrides. Only this complete shape may
+# be exempt, ending at whitespace, a quote or EOL. Quotes/spaces inside the one
+# port expression are opaque; no other URL component accepts templates.
+# Case folding applies only to the scheme and host, not query parameter names.
+SAFE_QUERY_PAIR = rb'(?:sslmode|application_name|connect_timeout)=[A-Za-z0-9_.-]*'
+LOOPBACK_URL = re.compile(
+    rb'(?i:[a-z][a-z0-9+.-]*://)[^\s:/@\'\"]*:(?P<pw>[^\s/@\'\"]+)@'
+    rb'(?i:localhost|127\.0\.0\.1|\[::1\])'
+    rb'(?::(?:[0-9]+|\$\{\{(?P<expression>(?:(?!\}\})[^\r\n])*)\}\}))?'
+    rb'/[A-Za-z0-9_-]+(?:\?' + SAFE_QUERY_PAIR + rb'(?:&' + SAFE_QUERY_PAIR + rb')*)?'
+    rb'(?=[\s\'\"]|$)')
 
-# Start after the authority so spaces/quotes inside a CI port stay opaque.
-# Stop at this URL's boundary; fragments cannot override libpq connection targets.
-URL_TAIL = re.compile(rb'[^\s\'"#]*')
-QUERY_TARGET = re.compile(rb'(?:^|[?&])host(?:addr)?=', re.IGNORECASE)
-
-# Loopbacks are fixtures only with an allowlisted password or a CI template port.
 def fixture(match):
     host = match.groupdict().get('host')
     if host is None:
         return False
-    authority_end = URL_SUFFIX.match(match.string, match.end())
-    suffix = authority_end.group()
-    if b'@' in match.group('userinfo') or b'@' in suffix or b',' in suffix or b',' in host:
+    if host.lower().endswith(b'.invalid'):
+        suffix = INVALID_SUFFIX.match(match.string, match.end()).group()
+        return not (b'@' in match.group('userinfo') or b'@' in suffix or b',' in suffix or b',' in host)
+    url = LOOPBACK_URL.match(match.string, match.start())
+    if url is None:
         return False
-    host = host.lower()
-    if host.endswith(b'.invalid'):
-        return True
-    if host not in (b'localhost', b'127.0.0.1', b'::1', b'[::1]'):
-        return False
-    query = URL_TAIL.match(match.string, authority_end.end()).group().partition(b'?')[2]
-    if QUERY_TARGET.search(query):
-        return False
-    port = CI_PORT.match(suffix)
-    return match.group('pw') in fixture_passwords or bool(port and port.group('expression').strip())
+    expression = url.group('expression')
+    if expression is not None:
+        return bool(expression.strip())
+    return url.group('pw') in fixture_passwords
 
 def scan_error(path):
     global errors
