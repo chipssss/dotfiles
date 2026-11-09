@@ -133,12 +133,16 @@ The credential scanner checks OpenAI/Anthropic API key shapes, GitHub tokens,
 three-part JWT-shaped strings, and generic
 `scheme://user:password@host.invalid/path`-shaped URLs, including empty usernames
 such as `redis://:password@host.invalid/0` and nested/binary output. Password URLs
-on reserved `.invalid` hosts or exact loopback hosts (`localhost`, `127.0.0.1`,
-`::1`, `[::1]`) are exempt regardless of the password, with no port, numeric ports,
-or CI template ports. Lookalikes such as `127.0.0.1.evil.com` and
-`localhost.example` are still flagged. The legacy `secret_fixture_passwords`
-setting remains accepted for config compatibility but no longer controls these
-exemptions. URLs without a password are not flagged by this rule.
+on reserved `.invalid` fixture hosts are exempt. Exact loopback hosts
+(`localhost`, `127.0.0.1`, `::1`, `[::1]`) are exempt only when the password is in
+`secret_fixture_passwords` (default: `postgres synthetic`), or the port itself is
+a complete `${{ ... }}` CI template expression. An explicit empty password list
+disables the password-based exemption, not the CI-port exemption. Numeric-port
+loopback URLs with other passwords are flagged, including SSH tunnel URLs.
+Lookalikes such as `127.0.0.1.evil.com` and `localhost.example`, multiple `@`
+delimiters, and comma-separated libpq hosts never receive a host exemption.
+Whitelist changes affect both scanner behavior and doctor's effective-config
+fingerprint. URLs without a password are not flagged by this rule.
 It prints locations/categories, never matched values. These patterns and custom
 regexes are finite checks, not proof that arbitrary data is non-secret. Human
 inspection remains necessary.

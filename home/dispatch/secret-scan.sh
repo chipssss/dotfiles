@@ -15,6 +15,7 @@ import dispatchconf
 
 try:
     conf = dispatchconf.load(allow_missing=True)
+    fixture_passwords = {pw.encode() for pw in dispatchconf.words(conf, 'secret_fixture_passwords')}
     extra = [(k.split('.', 1)[1], re.compile(v.encode())) for k, v in conf.items() if k.startswith('secret_pattern.')]
 except (OSError, ValueError, re.error) as e:
     print(f'{dispatchconf.path()}:0: 配置无法读取（{type(e).__name__}）')
@@ -25,7 +26,7 @@ PATTERNS = [
     ('OpenAI API key', re.compile(rb'\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}')),
     ('Anthropic API key', re.compile(rb'\bsk-ant-(?:api\d+-)?[A-Za-z0-9_-]{32,}')),
     ('带密码的 URL', re.compile(
-        rb'\b[a-z][a-z0-9+.-]*://[^\s:@/\'"]*:(?P<pw>[^\s@/\'"]+)@'
+        rb'\b[a-z][a-z0-9+.-]*://(?P<userinfo>[^\s:/\'"]*:(?P<pw>[^\s/\'"]+))@'
         # Keep bracketed-host suffixes so [::1].evil.com is not exempt.
         # Recognize bare ::1 only at a host boundary; leave port templates opaque.
         rb'(?P<host>\[[^\]]+\][^\s:/?#@\'"]*|::1(?=[:/?#\s\'"]|$)|'
@@ -34,15 +35,28 @@ PATTERNS = [
     ('GitHub 令牌', re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})')),
 ] + extra
 
-# Password URLs on exact loopback or reserved fixture hosts are not credentials.
+# Inspect the rest of the authority, not paths or later URLs on the same line.
+# CI expressions may contain spaces and quotes; keep them as opaque port text.
+# Reject ambiguous targets before applying any host exemption.
+URL_SUFFIX = re.compile(rb'(?:\$\{\{[^\r\n]*?\}\}|[^\s/\?#\'\"])*')
+
+CI_PORT = re.compile(rb':\$\{\{(?P<expression>(?:(?!\}\})[^\r\n])*)\}\}(?=[/?#]|$)')
+
+# Loopbacks are fixtures only with an allowlisted password or a CI template port.
 def fixture(match):
     host = match.groupdict().get('host')
     if host is None:
         return False
+    suffix = URL_SUFFIX.match(match.string, match.end()).group()
+    if b'@' in match.group('userinfo') or b'@' in suffix or b',' in suffix or b',' in host:
+        return False
     host = host.lower()
     if host.endswith(b'.invalid'):
         return True
-    return host in (b'localhost', b'127.0.0.1', b'::1', b'[::1]')
+    if host not in (b'localhost', b'127.0.0.1', b'::1', b'[::1]'):
+        return False
+    port = CI_PORT.match(suffix)
+    return match.group('pw') in fixture_passwords or bool(port and port.group('expression').strip())
 
 def scan_error(path):
     global errors

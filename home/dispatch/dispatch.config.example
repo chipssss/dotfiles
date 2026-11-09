@@ -17,6 +17,10 @@ ports = 3110-3999
 
 # Optional extra Python regex patterns. Scanner output never contains matched values.
 # secret_pattern.example-token = \bexample_[A-Za-z0-9]{20,}
-# Legacy compatibility setting, no longer used by the scanner.
-# Exact loopback hosts are exempt for any password, including CI template ports.
-# secret_fixture_passwords = postgres synthetic
+# Password whitelist for exact loopback hosts (default shown below).
+# Other loopback passwords are flagged, including numeric-port SSH tunnels,
+# unless the port itself is a complete ${{ ... }} CI template expression.
+# Multiple @ delimiters or comma-separated hosts never receive an exemption.
+# An empty list disables only the password-based exemption. Changes also affect
+# doctor's effective-config fingerprint.
+secret_fixture_passwords = postgres synthetic

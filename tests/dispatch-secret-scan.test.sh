@@ -17,17 +17,17 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
     config.write_text('')
     env = dict(os.environ, DISPATCH_CONFIG=str(config))
     artifact = root / 'artifact'
-    # Exact reported CI line with the password redacted, including the port expression.
-    artifact.write_text("DAILY_TEST_DATABASE_URL: postgresql://postgres:<pw>@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/daily_tests_admin\n")
+    # Synthetic service-container URL with a redacted password and CI port expression.
+    artifact.write_text("TEST_DATABASE_URL: postgresql://postgres:<pw>@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/app_test\n")
     scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
     assert scan.returncode == 0 and not scan.stdout and not scan.stderr, 'CI loopback URL must not be reported as a credential'
     print('PASS: redacted CI loopback URL is clean', flush=True)
 
     passed = 1
-    def check_url(host, port, expected, user='postgres', scheme='postgresql'):
+    def check_url(host, port, expected, user='postgres', scheme='postgresql', password='<pw>'):
         global passed
-        url = f'{scheme}://{user}:<pw>@{host}{port}/daily_tests_admin'
-        artifact.write_text('DAILY_TEST_DATABASE_URL: ' + url + '\n')
+        url = f'{scheme}://{user}:{password}@{host}{port}/app_test'
+        artifact.write_text('TEST_DATABASE_URL: ' + url + '\n')
         scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
         assert scan.returncode == expected, f'{host}, {port!r}: expected {expected}, got {scan.returncode}'
         assert not scan.stderr and url not in scan.stdout and '<pw>' not in scan.stdout, 'scanner must not echo credentials'
@@ -37,12 +37,46 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
             assert scan.stdout == f'{artifact}:1: 带密码的 URL\n', 'non-loopback URL must produce a password-URL finding'
         passed += 1
 
-    # Match only the complete host, independently of user, password or port syntax.
+    # A later @ or libpq host separator must never inherit a loopback exemption.
+    for host, port in [
+        ('localhost', '@db.prod.example.com:5432'),
+        ('[::1]', ':x@db.prod.example.com'),
+        ('127.0.0.1', '@cache.prod.example.com'),
+        ('localhost', ':5432,db.prod.example.com:5432'),
+        ('[::1]', ':5432,db.prod.example.com'),
+        ('::1', ':5432,db.prod.example.com'),
+        ('localhost,db.example.invalid', ''),
+        ('db.example.invalid', '@localhost:5432'),
+        ('@localhost', ':5432'),
+        ('localhost', ":${{ job.services.db.ports['5432'] }}@db.example.com"),
+        ('127.0.0.1', ":${{ job.services.db.ports['5432'] }},db.example.com"),
+    ]:
+        check_url(host, port, 1)
+        check_url(host, port, 1, user='', scheme='redis')
+        check_url(host, port, 1, password='synthetic')
+
+    # Multiple @ in userinfo are findings even if the final host is loopback.
+    check_url('localhost', ':5432', 1, user='user@name', password='synthetic')
+    ci_port = ":${{ job.services.db.ports['5432'] }}"
+    check_url('localhost', ci_port, 1, user='user@name')
+    check_url('localhost', ci_port, 1, password='synthetic@part')
+
+    # Exact loopbacks need a fixture password OR a complete CI port expression.
     ports = ['', ':5432', ":${{ job.services.postgres.ports['5432'] }}"]
-    for host in ['127.0.0.1', '::1', '[::1]', 'localhost', 'LOCALHOST']:
+    loopbacks = ['127.0.0.1', '::1', '[::1]', 'localhost', 'LOCALHOST']
+    for host in loopbacks:
         for port in ports:
             for user in ['postgres', '']:
-                check_url(host, port, 0, user=user)
+                check_url(host, port, 0 if port == ports[2] else 1, user=user)
+                check_url(host, port, 0, user=user, password='synthetic')
+
+    # Expressions outside the port, incomplete expressions and trailing port text
+    # are not service-container ports. Numeric tunnel passwords must still report.
+    for port in [':15432', '/${{ ports.db }}', ':5432/${{ ports.db }}',
+                 ':${{ ports.db', ':${{ }}', ':${{ ports.db }}evil',
+                 ':${{ ports.db }}:5432', ':prefix${{ ports.db }}',
+                 ':${{ ports.db }}evil${{ ports.other }}']:
+        check_url('127.0.0.1', port, 1)
 
     # A loopback-looking prefix or substring is never a loopback host exemption.
     for host in ['127.0.0.1.evil.com', 'localhost.example', '[::1].evil.com',
@@ -52,10 +86,35 @@ with tempfile.TemporaryDirectory(prefix='dispatch-secret-scan-') as tmp:
         for port in ports:
             for user in ['postgres', '']:
                 check_url(host, port, 1, user=user)
+                check_url(host, port, 1, user=user, password='synthetic')
+
+    # Encoded fixture lines can share a source-code line, but not an authority.
+    fixture_url = 'redis://' + ':synthetic@localhost/0'
+    remote_url = 'redis://' + ':<pw>@cache.example.com/0'
+    for content, expected in [
+        ('\\n'.join([fixture_url, fixture_url]), 0),
+        ('\\n'.join([fixture_url, remote_url]), 1),
+        ('"' + 'postgresql://' + 'user:<pw>@127.0.0.1:15432/app_test' + '"', 1),
+        ('redis://' + ':synthetic@localhost:5432\\n@db.example.com/0', 1),
+    ]:
+        artifact.write_text(content + '\n')
+        scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
+        assert scan.returncode == expected, 'scan each URL authority independently without losing remote findings'
+        assert not scan.stderr and (not scan.stdout if expected == 0 else scan.stdout == f'{artifact}:1: 带密码的 URL\n')
+        passed += 1
+
+    # Overrides replace the default whitelist, including an explicit empty list.
+    config.write_text('secret_fixture_passwords = demo-fixture\n')
+    check_url('localhost', ':5432', 0, password='demo-fixture')
+    check_url('localhost', ':5432', 1, password='synthetic')
+    check_url('localhost', ports[2], 0)
+    config.write_text('secret_fixture_passwords =\n')
+    check_url('localhost', ':5432', 1, password='synthetic')
+    check_url('localhost', ports[2], 0)
 
     # Loopback exemptions apply only to password URLs, not custom secret formats.
     config.write_text('secret_pattern.redacted-test = <pw>\n')
-    artifact.write_text('redis://' + ':<pw>@localhost:6379/0\n')
+    artifact.write_text('redis://' + ':<pw>@localhost:${{ ports.cache }}/0\n')
     scan = subprocess.run(['sh', str(scanner), str(artifact)], env=env, capture_output=True, text=True)
     assert scan.returncode == 1 and scan.stdout == f'{artifact}:1: redacted-test\n' and not scan.stderr
     passed += 1

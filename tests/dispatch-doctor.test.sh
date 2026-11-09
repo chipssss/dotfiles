@@ -135,20 +135,28 @@ secret_fixture_passwords = demo-fixture
     def scan(password, expected, host='localhost'):
         artifact.write_text('redis://' + 'fixture:' + password + '@' + host + '/test\n')
         p = subprocess.run([str(scripts / 'secret-scan.sh'), str(artifact)], env=env, capture_output=True)
-        assert p.returncode == expected, 'scanner exemptions must depend on the exact host, not fixture passwords'
+        assert p.returncode == expected, 'scanner must use the shared fixture password whitelist on exact loopbacks'
     scan('demo-fixture', 0)
-    scan('postgres', 0)
+    scan('postgres', 1)
     scan('demo-fixture', 1, host='cache.example.com')
+    default_fingerprint = doctor()['config_sha256']
     config.write_text('secret_fixture_passwords = override-fixture\n')
-    scan('demo-fixture', 0)
+    override_fingerprint = doctor()['config_sha256']
+    assert override_fingerprint != default_fingerprint
+    scan('demo-fixture', 1)
     scan('override-fixture', 0)
     scan('override-fixture', 1, host='cache.example.com')
-    # The legacy password setting remains readable but does not change host exemptions.
+    config.write_text('secret_fixture_passwords = override-fixture  override-fixture\n')
+    assert doctor()['config_sha256'] == override_fingerprint
+    config.write_text('secret_fixture_passwords =\n')
+    assert doctor()['config_sha256'] not in (default_fingerprint, override_fingerprint)
+    scan('demo-fixture', 1)
+    scan('override-fixture', 1)
     # Missing config remains fail-closed for approval, but scanning may use defaults.
     config.unlink()
     approve('git push origin feature/demo', 'git push', 1)
     env.pop('DISPATCH_CONFIG')
     scan('demo-fixture', 0)
     scan('demo-fixture', 1, host='cache.example.com')
-    print('PASS: shared defaults drive doctor, validation, launcher and approval; scanner uses exact-host exemptions')
+    print('PASS: shared defaults drive doctor, validation, launcher, approval and scanner; whitelist changes affect scanning and config hash')
 PY
