@@ -1,0 +1,21 @@
+# Shared machine policy. Copy to ~/.config/dispatch/config or set DISPATCH_CONFIG.
+# key = value, full-line comments only. No repository paths or workflow hooks.
+# Missing, broken, unknown or duplicate configuration fails closed for approvals.
+
+# main/master are always protected, even if omitted below.
+# Add any other shared branch patterns before enabling approvals.
+protected_branches = main master
+# Explicit opt-in for repositories with no additional shared branches:
+# approval_mode = generic
+
+# Deletion requires realpath containment and every symlink component must stay
+# within these roots. Never allow deleting a root itself.
+temp_dirs = /tmp/ /private/tmp/ .tmp/
+
+# One ten-port block per worker, reserved across repositories until clean.
+ports = 3110-3999
+
+# Optional extra Python regex patterns. Scanner output never contains matched values.
+# secret_pattern.example-token = \bexample_[A-Za-z0-9]{20,}
+# Loopback-only test-fixture passwords that are not secrets.
+secret_fixture_passwords = postgres synthetic

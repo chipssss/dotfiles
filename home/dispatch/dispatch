@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""Launch supervised Pi workers in any Git repository.
+
+  dispatch start NAME BRIEF [--base origin/main] [--existing-branch] [--dry-run]
+  dispatch status [--json]
+  dispatch wait [CURSOR]
+  dispatch clean NAME [--force]
+  dispatch doctor [--compare DIR] [--json]
+
+Run from a repository, or set DISPATCH_REPO. Runtime directories can be overridden
+with DISPATCH_STATE_DIR, DISPATCH_EVIDENCE_DIR and DISPATCH_WORKTREE_ROOT.
+Only machine-wide safety settings belong in DISPATCH_CONFIG.
+"""
+import argparse
+import datetime
+import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS))
+sys.dont_write_bytecode = True
+import dispatchconf
+
+DOTFILES = SCRIPTS.parent.parent
+PI_WORKER = SCRIPTS / 'pi-worker'
+PI_TRUST = Path.home() / '.pi/agent/trust.json'
+CONF = REPO = ROOT = EVIDENCE = WT_ROOT = PORTS = None
+
+
+class Refused(Exception):
+    pass
+
+
+def run(cmd, cwd=None, check=True):
+    p = subprocess.run(list(map(str, cmd)), cwd=cwd, capture_output=True, text=True)
+    if check and p.returncode:
+        # Never copy external stderr into notifications: it can contain credentials.
+        raise Refused(f'{Path(str(cmd[0])).name} 失败，exit {p.returncode}')
+    return p
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def configure():
+    global CONF, REPO, ROOT, EVIDENCE, WT_ROOT, PORTS
+    CONF = dispatchconf.load()
+    source = os.environ.get('DISPATCH_REPO', os.getcwd())
+    REPO = Path(run(['git', '-C', source, 'rev-parse', '--show-toplevel']).stdout.strip()).resolve()
+    common = run(['git', '-C', REPO, 'rev-parse', '--path-format=absolute', '--git-common-dir']).stdout.strip()
+    key = hashlib.sha256(common.encode()).hexdigest()[:16]
+    ROOT = Path(os.environ.get('DISPATCH_STATE_DIR', str(Path.home() / '.local/state/dispatch' / key))).expanduser().resolve()
+    EVIDENCE = Path(os.environ.get('DISPATCH_EVIDENCE_DIR', str(ROOT / 'outputs'))).expanduser().resolve()
+    WT_ROOT = Path(os.environ.get('DISPATCH_WORKTREE_ROOT', '/private/tmp/dispatch-wt')).expanduser().resolve()
+    first, last = map(int, CONF.get('ports', '3110-3999').split('-'))
+    PORTS = range(first, last - 8, 10)
+    os.environ['DISPATCH_CONFIG'] = str(dispatchconf.path().resolve())
+
+
+class Lock:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(200):
+            try:
+                self.path.mkdir()
+                return self
+            except FileExistsError:
+                time.sleep(.05)
+        raise Refused('状态锁被占用超过 10 秒，请先核对持有进程')
+
+    def __exit__(self, *exc):
+        self.path.rmdir()
+
+
+def worker_dir(name):
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', name):
+        raise Refused('NAME 只能含字母、数字、- 和 _')
+    return ROOT / 'workers' / name
+
+
+def save(state):
+    d = worker_dir(state['name'])
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / 'state.json.tmp'
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n')
+    tmp.replace(d / 'state.json')
+
+
+def load(name):
+    return json.loads((worker_dir(name) / 'state.json').read_text())
+
+
+def workers():
+    return [json.loads(p.read_text()) for p in sorted((ROOT / 'workers').glob('*/state.json'))]
+
+
+def alive(path):
+    try:
+        pid = int(path.read_text())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def allocate_ports():
+    used = {s['ports']['base'] for s in workers() if s.get('ports')}
+    # The process lock is global across repositories, and other states reserve their
+    # blocks until clean. The live listener check also covers non-dispatch processes.
+    registry = WT_ROOT / '.ports'
+    for base in PORTS:
+        if base in used or (registry / str(base)).exists():
+            continue
+        p = run(['lsof', '-nP', f'-iTCP:{base}-{base + 9}', '-sTCP:LISTEN', '-t'], check=False)
+        if p.returncode not in (0, 1):
+            raise Refused('无法检查端口占用')
+        if not p.stdout.strip():
+            return {'base': base, 'api': base + 1, 'web': base + 2, 'last': base + 9}
+    raise Refused('没有空闲端口段')
+
+
+def protected_branch(branch):
+    return any(fnmatch.fnmatchcase(branch, p) for p in ['main', 'master', *dispatchconf.words(CONF, 'protected_branches')])
+
+
+def normalize_base(base):
+    base = base.removeprefix('origin/')
+    remotes = run(['git', '-C', REPO, 'remote']).stdout.splitlines()
+    if base.startswith(('refs/', 'upstream/')) or any(base.startswith(r + '/') for r in remotes if r != 'origin'):
+        raise Refused('--base 只接受 origin 的分支名')
+    validate_branch(base)
+    return base
+
+
+def validate_branch(branch):
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./-]*', branch) or run(['git', 'check-ref-format', '--branch', branch], check=False).returncode:
+        raise Refused('分支名不合法')
+
+
+def remote_head(branch):
+    p = run(['git', '-C', REPO, 'ls-remote', '--exit-code', '--heads', 'origin', 'refs/heads/' + branch], check=False)
+    if p.returncode not in (0, 2):
+        raise Refused('无法核对远端分支')
+    return p.stdout.split()[0] if p.returncode == 0 else None
+
+
+def compose_brief(state, task, common):
+    parts = [Path(common).read_text()] if common else []
+    p = state['ports']
+    parts.append(f"""## 本次运行
+- 名称 {state['name']}，报告写 `{state['out']}`。
+- 只在 worktree `{state['worktree']}` 的 `{state['branch']}` 分支工作。
+- 端口段 {p['base']}-{p['last']}，API {p['api']}，前端 {p['web']}。
+- 安全确认由监管处理，需要人工时通知并继续等待。
+""")
+    parts.append(Path(task).read_text())
+    return '\n\n'.join(parts)
+
+
+def spawn_runner(name):
+    with (worker_dir(name) / 'supervisor.log').open('a') as log:
+        p = subprocess.Popen([sys.executable, '-I', str(SCRIPTS / 'dispatch'), '_run', name],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                             env=dict(os.environ, DISPATCH_REPO=str(REPO), DISPATCH_STATE_DIR=str(ROOT),
+                                      DISPATCH_EVIDENCE_DIR=str(EVIDENCE), DISPATCH_WORKTREE_ROOT=str(WT_ROOT)))
+    (worker_dir(name) / 'runner.pid').write_text(str(p.pid))
+
+
+def trust_worktree_root():
+    """Trust only the launcher-owned parent; Pi would otherwise wait before the task."""
+    PI_TRUST.parent.mkdir(parents=True, exist_ok=True)
+    with Lock(Path(str(PI_TRUST) + '.lock')):
+        data = json.loads(PI_TRUST.read_text()) if PI_TRUST.exists() else {}
+        data[str(WT_ROOT)] = True
+        tmp = PI_TRUST.with_suffix('.dispatch-tmp')
+        tmp.write_text(json.dumps(dict(sorted(data.items())), indent=2) + '\n')
+        tmp.replace(PI_TRUST)
+
+
+def cmd_start(a):
+    d = worker_dir(a.name)
+    base = normalize_base(a.base)
+    branch = a.branch or 'dispatch/' + a.name.lower()
+    validate_branch(branch)
+    if protected_branch(branch):
+        raise Refused('不能在受保护分支启动 worker')
+    wt = WT_ROOT / a.name
+    task = Path(a.brief).read_text()
+    if not task.strip():
+        raise Refused('brief 为空')
+    if a.common:
+        Path(a.common).read_text()
+    if d.exists() or wt.exists():
+        raise Refused('名称或 worktree 已存在，先 status / clean')
+    if not remote_head(base):
+        raise Refused('origin 上没有 base 分支')
+    resume_head = remote_head(branch)
+    if bool(resume_head) != a.existing_branch:
+        raise Refused('远端分支已存在时必须加 --existing-branch，续写时分支必须存在')
+    if not run(['git', '-C', REPO, 'show-ref', '--verify', '--quiet', 'refs/heads/' + branch], check=False).returncode:
+        raise Refused('本地同名分支已存在，不自动覆盖')
+    # A global allocator lock also serializes launches with different state roots.
+    if a.dry_run:
+        ports = allocate_ports()
+        print(f'dry-run {a.name}: repo {REPO}, origin/{base}, branch {branch}, worktree {wt}, ports {ports["base"]}-{ports["last"]}')
+        return
+    with Lock(WT_ROOT / '.allocator-lock'), Lock(ROOT / '.lock'):
+        if d.exists() or wt.exists():
+            raise Refused('并发启动占用了名称或 worktree')
+        ports = allocate_ports()
+        state = dict(name=a.name, branch=branch, base=base, worktree=str(wt), ports=ports,
+                     out=str(EVIDENCE / a.name / 'result.md'), model=a.model, thinking=a.thinking,
+                     timeout_min=a.timeout, started_at=now(), phase='preparing', owns_local=False,
+                     resumed=a.existing_branch, repo=str(REPO))
+        save(state)
+        reservation = WT_ROOT / '.ports' / str(ports['base'])
+        reservation.parent.mkdir(parents=True, exist_ok=True)
+        reservation.write_text(str(d))
+        try:
+            trust_worktree_root()
+            start = branch if a.existing_branch else base
+            run(['git', '-C', REPO, 'fetch', '-q', 'origin', f'refs/heads/{start}:refs/remotes/origin/{start}'])
+            state['local_pending'] = True
+            save(state)
+            p = run(['git', '-C', REPO, 'worktree', 'add', '-q', '--no-track', '-b', branch, wt, f'origin/{start}'], check=False)
+            # A known nonzero exit is not an indeterminate network operation.
+            state['local_pending'] = False
+            if p.returncode:
+                save(state)
+                raise Refused('worktree 创建失败，请检查状态后 clean')
+            state['owns_local'] = True
+            save(state)
+            if a.existing_branch:
+                if run(['git', '-C', wt, 'rev-parse', 'HEAD']).stdout.strip() != resume_head:
+                    raise Refused('续写分支在启动期间改变，请 clean 后重试')
+                run(['git', '-C', wt, 'branch', '--set-upstream-to=origin/' + branch])
+            # Fresh branches stay local until the worker explicitly pushes them.
+            (d / 'brief.md').write_text(compose_brief(state, a.brief, a.common))
+            state['phase'] = 'ready'
+            save(state)
+            spawn_runner(a.name)
+        except Exception as e:
+            state.update(phase='failed', failure=type(e).__name__)
+            save(state)
+            raise Refused('start 失败，状态已保留；status 后 clean 再重试') from e
+    print(f'started {a.name}: {wt}, {branch}, ports {ports["base"]}-{ports["last"]}\nreport {state["out"]}')
+
+
+def context_args(directory):
+    f = Path(directory) / 'AGENTS.md'
+    return ['--context', str(f)] if f.is_file() else []
+
+
+def cmd_run(a):
+    state = load(a.name)
+    d = worker_dir(a.name)
+    (d / 'runner.pid').write_text(str(os.getpid()))
+    code = subprocess.call(['sh', str(PI_WORKER), '--model', state['model'], '--thinking', state['thinking'],
+                            '--cwd', state['worktree'], *context_args(state['worktree']), '--prompt-file', str(d / 'brief.md'),
+                            '--out', state['out'], '--label', 'dispatch ' + a.name,
+                            '--timeout-min', str(state['timeout_min']), '--idle-min', '12'])
+    targets = [p for p in [Path(state['out']).parent, d / 'supervisor.log'] if p.exists()]
+    scan = run([SCRIPTS / 'secret-scan.sh', *targets], check=False) if targets else None
+    (d / 'exit.json').write_text(json.dumps({'code': code, 'scan': scan.returncode if scan else 2, 'at': now()}))
+
+
+def cmd_status(a):
+    rows = []
+    for state in workers():
+        d = worker_dir(state['name'])
+        out = Path(state['out'])
+        phase = state.get('phase', 'unknown')
+        if alive(d / 'runner.pid'):
+            phase = 'needs-human' if Path(str(out) + '.needs-human').exists() else 'stuck' if Path(str(out) + '.stuck').exists() else 'running'
+        elif (d / 'exit.json').exists():
+            phase = 'finished'
+        elif phase == 'ready':
+            phase = 'exited'
+        rows.append(dict(name=state['name'], phase=phase, branch=state.get('branch'), ports=state.get('ports'), out=state['out']))
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+    else:
+        for row in rows:
+            print(f'{row["name"]}: {row["phase"]}, {row["branch"]}, ports {row["ports"]}, {row["out"]}')
+        if not rows:
+            print('没有在跑的 worker')
+
+
+def cmd_clean(a):
+    with Lock(WT_ROOT / '.allocator-lock'), Lock(ROOT / '.lock'):
+        state = load(a.name)
+        d = worker_dir(a.name)
+        if state.get('local_pending'):
+            raise Refused('创建被中断，先用 git worktree list 和 git show-ref 核对资源归属，不删除未知资源')
+        pid = alive(d / 'runner.pid')
+        if pid and not a.force:
+            raise Refused('监管仍在运行，确认放弃才可 --force')
+        if pid:
+            os.killpg(pid, signal.SIGTERM)
+            for _ in range(100):
+                if not alive(d / 'runner.pid'):
+                    break
+                time.sleep(.05)
+            else:
+                raise Refused('监管尚未退出，保留资源后重试')
+        # Read old states too, but never delete a remote branch.
+        wt = Path(state['worktree']) if state.get('worktree') else None
+        if wt and state.get('owns_local', not state.get('adopted')):
+            if wt.exists():
+                run(['git', '-C', REPO, 'worktree', 'remove', *(['--force'] if a.force else []), wt])
+            if not run(['git', '-C', REPO, 'show-ref', '--verify', '--quiet', 'refs/heads/' + state['branch']], check=False).returncode:
+                run(['git', '-C', REPO, 'branch', '-D' if a.force else '-d', state['branch']])
+        if state.get('ports'):
+            reservation = WT_ROOT / '.ports' / str(state['ports']['base'])
+            if reservation.exists() and reservation.read_text() == str(d):
+                reservation.unlink()
+        archive = ROOT / 'archive' / f'{a.name}-{time.time_ns()}'
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        d.rename(archive)
+        print(f'cleaned {a.name}; remote branches retained; archive {archive}')
+
+
+class Doctor:
+    def __init__(self, json_mode=False):
+        self.failed = 0
+        self.json_mode = json_mode
+        self.checks = []
+
+    def say(self, level, area, text):
+        self.failed += level == 'FAIL'
+        self.checks.append(dict(level=level, area=area, text=text))
+        if not self.json_mode:
+            print(f'{level:4}  {area:8} {text}')
+
+
+def same_file(a, b):
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
+
+
+def compare_dir(doc, directory):
+    for local in sorted(Path(directory).iterdir()):
+        if not local.is_file():
+            continue
+        repo = SCRIPTS / local.name
+        if not repo.is_file():
+            doc.say('WARN', 'drift', f'{local}: 本机 helper，不在共享工具中')
+        elif local.is_symlink() and local.resolve() == repo.resolve():
+            doc.say('OK', 'drift', f'{local}: 仓库链接')
+        elif same_file(local, repo):
+            doc.say('WARN', 'drift', f'{local}: 相同的手装副本')
+        else:
+            doc.say('WARN', 'drift', f'diff -u {repo} {local}')
+
+
+def cmd_doctor(a):
+    doc = Doctor(a.json)
+    config_sha256 = None
+    try:
+        conf = dispatchconf.load()
+        dispatchconf.approval_policy(conf)
+        # Hash effective policy, not its path, comments or presentation whitespace.
+        effective = dict(ports='3110-3999', approval_mode='strict', protected_branches='',
+                         temp_dirs='/tmp/ /private/tmp/ .tmp/', secret_fixture_passwords='postgres synthetic')
+        effective.update(conf)
+        for key in ('protected_branches', 'temp_dirs', 'secret_fixture_passwords'):
+            effective[key] = sorted(set(dispatchconf.words(effective, key)))
+        effective['protected_branches'] = sorted(set(['main', 'master', *effective['protected_branches']]))
+        config_sha256 = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()
+    except (OSError, ValueError):
+        doc.say('FAIL', 'config', '配置缺失、无效或策略不完整')
+    head = run(['git', '-C', DOTFILES, 'rev-parse', 'HEAD']).stdout.strip()
+    dirty = bool(run(['git', '-C', DOTFILES, 'status', '--porcelain', '--untracked-files=normal']).stdout)
+    doc.say('OK', 'version', f'{DOTFILES} HEAD {head}')
+    if config_sha256:
+        doc.say('OK', 'config', str(dispatchconf.path()))
+    doc.say('WARN' if dirty else 'OK', 'checkout', '有未提交改动' if dirty else '干净')
+    fingerprints = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(SCRIPTS.iterdir()) if p.is_file()}
+    deps, versions = {}, {}
+    for tool in ['python3', 'git', 'pi', 'rex', 'lsof', 'osascript', 'sandbox-exec', 'realpath']:
+        deps[tool] = shutil.which(tool)
+        doc.say('OK' if deps[tool] else 'FAIL', 'deps', f'{tool}: {deps[tool] or "missing"}')
+        if deps[tool] and tool in ('python3', 'git', 'pi', 'rex'):
+            try:
+                p = subprocess.run([deps[tool], '--version'], capture_output=True, text=True, timeout=5)
+                versions[tool] = p.stdout.strip().splitlines()[0] if p.returncode == 0 and p.stdout.strip() else 'unknown'
+            except subprocess.TimeoutExpired:
+                versions[tool] = 'version probe timed out'
+            doc.say('OK', 'version', f'{tool}: {versions[tool]}')
+    install = {}
+    for installed, source in [(Path.home() / '.local/bin/dispatch', SCRIPTS / 'dispatch'),
+                              (Path.home() / '.claude/bin/pi-worker', PI_WORKER)]:
+        kind = 'symlink' if installed.is_symlink() else 'copy' if installed.is_file() else 'missing'
+        status = 'drifted'
+        if installed.is_symlink() and installed.resolve() == source:
+            status = 'linked'
+            doc.say('OK', 'install', f'{installed}: 仓库链接')
+        elif same_file(installed, source):
+            status = 'identical-copy'
+            doc.say('WARN', 'install', f'{installed}: 相同副本，尚未部署为链接')
+        else:
+            if kind == 'missing':
+                status = 'missing'
+            doc.say('WARN', 'drift', f'{installed}: 尚未安装或与当前 checkout 不同；部署前 diff -u {source} {installed}')
+        install[source.name] = dict(path=str(installed), kind=kind, status=status)
+    for directory in a.compare:
+        compare_dir(doc, directory)
+    if a.json:
+        print(json.dumps(dict(head=head, files=fingerprints, dependencies=deps, versions=versions,
+                              config_sha256=config_sha256, dirty=dirty, install=install,
+                              checks=doc.checks, fail_count=doc.failed), sort_keys=True, indent=2))
+    else:
+        print(f'FAIL count: {doc.failed}')
+    return 1 if doc.failed else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('start')
+    s.add_argument('name')
+    s.add_argument('brief')
+    s.add_argument('--base', default='origin/main')
+    s.add_argument('--branch')
+    s.add_argument('--existing-branch', action='store_true', help='继续 origin 上已有分支，不依赖托管平台')
+    s.add_argument('--common')
+    s.add_argument('--timeout', type=int, default=180)
+    s.add_argument('--model', default=os.environ.get('DISPATCH_MODEL', 'openai/gpt-6.1-sol'))
+    s.add_argument('--thinking', default='high')
+    s.add_argument('--dry-run', action='store_true')
+    s = sub.add_parser('status')
+    s.add_argument('--json', action='store_true')
+    s = sub.add_parser('wait')
+    s.add_argument('cursor', nargs='?')
+    s = sub.add_parser('clean')
+    s.add_argument('name')
+    s.add_argument('--force', action='store_true')
+    s = sub.add_parser('doctor')
+    s.add_argument('--compare', action='append', default=[])
+    s.add_argument('--json', action='store_true')
+    s = sub.add_parser('_run')
+    s.add_argument('name')
+    a = ap.parse_args()
+    try:
+        if a.cmd == 'wait':
+            os.execv('/bin/sh', ['sh', str(SCRIPTS / 'pi-events-wait.sh'), *([a.cursor] if a.cursor else [])])
+        if a.cmd == 'doctor':
+            return cmd_doctor(a)
+        configure()
+        {'start': cmd_start, 'status': cmd_status, 'clean': cmd_clean, '_run': cmd_run}[a.cmd](a)
+        return 0
+    except (Refused, ValueError, OSError) as e:
+        print(f'dispatch: {e}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

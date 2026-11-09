@@ -1,0 +1,181 @@
+#!/bin/sh
+# Run one worker as an interactive pi session in a Rex pane:
+# the full TUI is visible and the brief is the first
+# message. The worker writes its answer to --out and then OUT.done; this script
+# supervises the pane until that marker (or the timeout), closes the pane and
+# prints the out path.
+# usage: pi-worker --model PROVIDER/ID [--thinking LEVEL] [--readonly] --cwd DIR --prompt-file FILE --out FILE [--label TEXT] [--timeout-min N] [--context FILE]... [--idle-min N]
+#        pi-worker --attach BLOCK --out FILE [--label TEXT] [--timeout-min N] [--idle-min N]
+# --context: skip AGENTS.md/CLAUDE.md discovery (which walks up into parent homes) and load only these files.
+# --attach: supervise an already running pi pane instead of launching one.
+# Supervision never exits on a confirmation that needs a human, an idle pane or an empty report:
+# it writes OUT.needs-human / OUT.stuck, appends an event to $PI_SUPERVISOR_STATE_DIR/events.log,
+# posts a macOS notification and keeps watching. Exit codes: 0 done, 1 pane gone, 124 timeout.
+set -eu
+# Installed as a symlink (~/.claude/bin/pi-worker); its helpers live next to the real file.
+PI_SCRIPTS=$(dirname -- "$(realpath -- "$0")")
+export PI_SCRIPTS
+. "$PI_SCRIPTS/approve-rules.sh"
+. "$PI_SCRIPTS/completion-rules.sh"
+model='' thinking=high readonly=0 cwd='' prompt='' out='' label='' timeout=90 idle=10 contexts='' attach=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) model=$2; shift 2 ;;
+    --thinking) thinking=$2; shift 2 ;;
+    --readonly) readonly=1; shift ;;
+    --cwd) cwd=$2; shift 2 ;;
+    --prompt-file) prompt=$2; shift 2 ;;
+    --out) out=$2; shift 2 ;;
+    --label) label=$2; shift 2 ;;
+    --timeout-min) timeout=$2; shift 2 ;;
+    --context) contexts="$contexts
+$2"; shift 2 ;;
+    --idle-min) idle=$2; shift 2 ;;
+    --attach) attach=$2; shift 2 ;;
+    *) echo "pi-worker: unknown argument $1" >&2; exit 64 ;;
+  esac
+done
+if [ -n "$attach" ]; then
+  [ -n "$out" ] || { echo "pi-worker: --attach needs --out" >&2; exit 64; }
+else
+  [ -n "$model" ] && [ -n "$cwd" ] && [ -n "$prompt" ] && [ -n "$out" ] || { echo "pi-worker: --model, --cwd, --prompt-file and --out are required" >&2; exit 64; }
+  [ -f "$prompt" ] || { echo "pi-worker: no prompt file $prompt" >&2; exit 64; }
+fi
+mkdir -p "$(dirname "$out")"
+: "${label:=pi $(basename "$out")}"
+name=${label#* }
+events=${PI_SUPERVISOR_STATE_DIR:-/private/tmp/pi-supervisor}/events.log
+mkdir -p "$(dirname "$events")"
+scope=
+[ -n "${REX_SESSION:-}" ] && scope="-s $REX_SESSION"
+
+# Event text is a fixed reason, never captured command text (it can hold credentials).
+notify() {
+  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" >> "$events"
+  echo "pi-worker: $1" >&2
+  osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "pi-worker"' -e 'end run' "$1" >/dev/null 2>&1 &
+}
+
+if [ -n "$attach" ]; then
+  block=$attach
+else
+  rm -f "$out" "$out.done" "$out.needs-human" "$out.stuck"
+  tools=read,bash,edit,write,grep,find,ls
+  rule="When you are finished, write your complete final answer to $out with the write tool, then check with ls -la that $out is non-empty (a very long answer can be truncated to an empty write; if so, write it again in parts with bash appends), then write the single word done to $out.done."
+  if [ "$readonly" = 1 ]; then
+    tools=read,bash,grep,find,ls,write
+    set -- -e "$PI_SCRIPTS/pi-readonly.ts" --readonly-out "$out"
+    rule="$rule You are read-only: bash runs in a sandbox that blocks file writes outside temp dirs, and the write tool only accepts those two files."
+  fi
+  if [ -n "$contexts" ]; then
+    set -- "$@" --no-context-files
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ -f "$f" ] || { echo "pi-worker: no context file $f" >&2; exit 64; }
+      set -- "$@" --append-system-prompt "$f"
+    done <<EOF
+$contexts
+EOF
+  fi
+  brief="$(cat "$prompt")
+
+$rule"
+  # pi runs every bash command in a fresh shell at --cwd, so a push without cd runs there.
+  PI_APPROVE_CWD=$(cd "$cwd" && pwd -P)
+  export PI_APPROVE_CWD
+  # shellcheck disable=SC2086
+  block=$(cd "$cwd" && rex run $scope --focus=false --label "$label" --json --shell=none -- \
+    pi --tui-mode regular --no-session --model "$model" --thinking "$thinking" --tools "$tools" "$@" "$brief" |
+    sed -n 's/.*"\(block:[^"]*\)".*/\1/p' | head -1)
+  [ -n "$block" ] || { echo "pi-worker: rex run did not return a pane" >&2; exit 1; }
+fi
+printf '%s\n' "$block" > "$out.block"
+# shellcheck disable=SC2086
+trap 'rex block close $scope "$block" >/dev/null 2>&1; exit 143' TERM INT HUP
+deadline=$(( $(date +%s) + timeout * 60 ))
+last_screen='' last_change=$(date +%s) needs='' stuck='' nudged=0 resumes=0
+set_stuck() {
+  [ "$stuck" = "$1" ] && return 0
+  stuck=$1
+  if [ -n "$1" ]; then printf '%s\n' "$1" > "$out.stuck"; notify "STUCK $name: $1"; else rm -f "$out.stuck"; fi
+}
+while :; do
+  if completion_check "$out" "$block"; then
+    break
+  else
+    completed=$?
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    notify "TIMEOUT $name: ${timeout} 分钟内没有 .done，面板保留"
+    exit 124
+  fi
+  # shellcheck disable=SC2086
+  if ! rex block inspect $scope "$block" >/dev/null 2>&1 && [ ! -f "$out.done" ]; then
+    notify "EXITED $name: 面板在写 .done 前退出（模型名错误或 pi 启动失败？）"
+    exit 1
+  fi
+  # shellcheck disable=SC2086
+  tailtext=$(rex block capture $scope -b "$block" --trim 2>/dev/null | tail -200)
+  if safe_ask "$tailtext"; then
+    # shellcheck disable=SC2086
+    rex block send-key $scope -b "$block" enter >/dev/null 2>&1 || true
+    echo "pi-worker: auto-approved: $APPROVAL_REASON" >&2
+    sleep 5
+    continue
+  else
+    approval=$?
+  fi
+  if [ "$approval" = 1 ]; then
+    key=$(approval_key "$tailtext")
+    if [ "$key" != "$needs" ]; then
+      needs=$key
+      printf '%s\n%s\n' "$APPROVAL_REASON" "$block" > "$out.needs-human"
+      notify "NEEDS HUMAN $name: $APPROVAL_REASON"
+    fi
+    # Never type into a pending dialog: an idle nudge's enter would answer it.
+    sleep 10
+    continue
+  fi
+  if [ -n "$needs" ] && ! printf '%s' "$tailtext" | grep -q 'Confirm external or irreversible action'; then
+    needs=
+    rm -f "$out.needs-human"
+    notify "RESOLVED $name: 确认框已处理，继续监管"
+  fi
+  if [ "$completed" = 2 ]; then
+    set_stuck "$(basename -- "$out") 为空或产出未通过安全扫描，重写已达 3 次；补好安全非空报告和 .done 后自动收卷"
+    sleep 10
+    continue
+  fi
+  screen=$(printf '%s' "$tailtext" | cksum)
+  if [ "$screen" != "$last_screen" ]; then
+    last_screen=$screen last_change=$(date +%s) nudged=0
+    case "$stuck" in 空闲*) set_stuck '' ;; esac
+  fi
+  if printf '%s' "$tailtext" | grep -v '^[[:space:]]*$' | tail -15 | grep -Eq 'Retry failed after|Connection error|ECONNRESET|fetch failed|overloaded_error|Request timed out' && [ $(( $(date +%s) - last_change )) -ge 20 ]; then
+    if [ "$resumes" -lt 8 ]; then
+      resumes=$(( resumes + 1 ))
+      "$PI_SCRIPTS/pi-send.sh" "$block" "上一次是模型连接中断。请从中断处继续完成原任务，完成后照原要求写 $out 和 $out.done。" >/dev/null 2>&1 || true
+      echo "pi-worker: model connection failed; resumed ($resumes/8)" >&2
+      last_change=$(date +%s)
+    else
+      set_stuck "上游模型连续中断，已续跑 8 次"
+    fi
+    sleep 10
+    continue
+  fi
+  if [ $(( $(date +%s) - last_change )) -ge $(( idle * 60 )) ] && [ ! -f "$out.done" ]; then
+    if [ "$nudged" = 0 ]; then
+      nudged=1 last_change=$(date +%s)
+      "$PI_SCRIPTS/pi-send.sh" "$block" "监管检查：你已经 ${idle} 分钟没有动静。如果任务已完成，请照原要求写 $out 和 $out.done；如果还没完成，请继续推进原任务的全部要求。" >/dev/null 2>&1 || true
+      echo "pi-worker: nudged idle pane" >&2
+    else
+      set_stuck "空闲 ${idle} 分钟，催过一次仍无动静"
+    fi
+  fi
+  sleep 10
+done
+rm -f "$out.needs-human" "$out.stuck"
+notify "DONE $name"
+# shellcheck disable=SC2086
+[ -n "$block" ] && rex block close $scope "$block" >/dev/null 2>&1 || true
+echo "$out"

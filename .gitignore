@@ -30,3 +30,6 @@ result-*
 !**/dummy.key
 home/.ssh/
 .fm-adp-secrets.env
+
+# Python bytecode from home/dispatch helpers
+__pycache__/

@@ -54,6 +54,13 @@ in
   home.file.".pi/agent/settings.json".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.pi/agent/settings.json";
 
+  # Pi worker dispatch (home/dispatch/README.md). The helpers stay in the repo next to these
+  # entry points; only machine-wide safety policy belongs in the local config.
+  home.file.".local/bin/dispatch".source =
+    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/dispatch/dispatch";
+  home.file.".claude/bin/pi-worker".source =
+    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/dispatch/pi-worker";
+
   home.file.".claude/CLAUDE.md".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/AGENTS.md";
   home.file.".codex/AGENTS.md".source =

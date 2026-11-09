@@ -31,6 +31,7 @@ Running the switch builds:
 - Terminal (WezTerm config with the rose-pine moon theme and dimmed unfocused windows)
 - Agent configs (Claude, Codex, opencode all share one AGENTS.md)
 - Optional Pi theme and local extensions, generic UI settings and model overrides, plus two deliberately pinned third-party Pi packages
+- Shared Agent environment: `pi-worker` supervision, conservative approvals, secret scanning and a lightweight Git worktree launcher (see [`home/dispatch/README.md`](home/dispatch/README.md)); no project workflow or hosting-platform dependency
 
 ## Prerequisites
 
