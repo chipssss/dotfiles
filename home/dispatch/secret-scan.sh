@@ -24,14 +24,17 @@ PATTERNS = [
     ('私钥', re.compile(rb'-----BEGIN (?:[A-Z]+ )*PRIVATE KEY(?: BLOCK)?-----')),
     ('OpenAI API key', re.compile(rb'\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}')),
     ('Anthropic API key', re.compile(rb'\bsk-ant-(?:api\d+-)?[A-Za-z0-9_-]{32,}')),
-    ('带密码的 URL', re.compile(rb'\b[a-z][a-z0-9+.-]*://[^\s:@/\'"]*:(?P<pw>[^\s@/\'"]+)@(?P<host>\[[^\]]+\]|[^\s:/?#@\'"]+)', re.IGNORECASE)),
+    ('带密码的 URL', re.compile(
+        rb'\b[a-z][a-z0-9+.-]*://[^\s:@/\'"]*:(?P<pw>[^\s@/\'"]+)@'
+        # Keep bracketed-host suffixes so [::1].evil.com is not exempt.
+        # Recognize bare ::1 only at a host boundary; leave port templates opaque.
+        rb'(?P<host>\[[^\]]+\][^\s:/?#@\'"]*|::1(?=[:/?#\s\'"]|$)|'
+        rb'[^\s:/?#@\'"]+|[^\s/?#@\'"]+)', re.IGNORECASE)),
     ('JWT', re.compile(rb'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])')),
     ('GitHub 令牌', re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})')),
 ] + extra
 
-# Test fixtures on loopback or reserved hosts are not credentials.
-FIXTURE_PASSWORDS = {w.encode() for w in dispatchconf.words(conf, 'secret_fixture_passwords')}
-
+# Password URLs on exact loopback or reserved fixture hosts are not credentials.
 def fixture(match):
     host = match.groupdict().get('host')
     if host is None:
@@ -39,7 +42,7 @@ def fixture(match):
     host = host.lower()
     if host.endswith(b'.invalid'):
         return True
-    return host in (b'localhost', b'127.0.0.1', b'[::1]') and match['pw'] in FIXTURE_PASSWORDS
+    return host in (b'localhost', b'127.0.0.1', b'::1', b'[::1]')
 
 def scan_error(path):
     global errors

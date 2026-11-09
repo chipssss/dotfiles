@@ -74,7 +74,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-doctor-', dir='/private/tmp') 
     assert doctor(1)['config_sha256'] is None
     print('PASS: doctor pure JSON, effective config, dirty checkout, installation and failure states')
 
-    # Simulate changing the shared defaults in an isolated checkout. All public
+    # Simulate changing the shared defaults in an isolated checkout. Policy
     # consumers must observe the change, not just doctor or one helper.
     defaults_module = scripts / 'dispatchconf.py'
     defaults_module.write_text(defaults_module.read_text() + '''
@@ -132,19 +132,23 @@ secret_fixture_passwords = demo-fixture
     config.write_text('')
 
     artifact = root / 'artifact'
-    def scan(password, expected):
-        artifact.write_text('redis://' + 'fixture:' + password + '@localhost/test\n')
+    def scan(password, expected, host='localhost'):
+        artifact.write_text('redis://' + 'fixture:' + password + '@' + host + '/test\n')
         p = subprocess.run([str(scripts / 'secret-scan.sh'), str(artifact)], env=env, capture_output=True)
-        assert p.returncode == expected, 'scanner must use shared fixture passwords'
+        assert p.returncode == expected, 'scanner exemptions must depend on the exact host, not fixture passwords'
     scan('demo-fixture', 0)
-    scan('postgres', 1)
+    scan('postgres', 0)
+    scan('demo-fixture', 1, host='cache.example.com')
     config.write_text('secret_fixture_passwords = override-fixture\n')
-    scan('demo-fixture', 1)
+    scan('demo-fixture', 0)
     scan('override-fixture', 0)
+    scan('override-fixture', 1, host='cache.example.com')
+    # The legacy password setting remains readable but does not change host exemptions.
     # Missing config remains fail-closed for approval, but scanning may use defaults.
     config.unlink()
     approve('git push origin feature/demo', 'git push', 1)
     env.pop('DISPATCH_CONFIG')
     scan('demo-fixture', 0)
-    print('PASS: shared defaults drive doctor, validation, launcher, approval and scanner; explicit overrides win')
+    scan('demo-fixture', 1, host='cache.example.com')
+    print('PASS: shared defaults drive doctor, validation, launcher and approval; scanner uses exact-host exemptions')
 PY

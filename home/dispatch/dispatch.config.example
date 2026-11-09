@@ -17,5 +17,6 @@ ports = 3110-3999
 
 # Optional extra Python regex patterns. Scanner output never contains matched values.
 # secret_pattern.example-token = \bexample_[A-Za-z0-9]{20,}
-# Loopback-only test-fixture passwords that are not secrets.
-secret_fixture_passwords = postgres synthetic
+# Legacy compatibility setting, no longer used by the scanner.
+# Exact loopback hosts are exempt for any password, including CI template ports.
+# secret_fixture_passwords = postgres synthetic
