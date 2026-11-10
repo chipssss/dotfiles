@@ -6,6 +6,8 @@ export ROOT
 exec python3 -B - <<'PY'
 import json
 import os
+import re
+from graphlib import TopologicalSorter
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,17 +18,35 @@ with tempfile.TemporaryDirectory(prefix='pi-settings-') as tmp:
     root = Path(tmp)
     defaults = root / 'defaults.json'
     defaults.write_text(json.dumps({'packages': ['npm:example'], 'compaction': {'enabled': True}}))
-    old = root / 'old.json'
+    old = root / 'checkout/home/settings.json'
+    old.parent.mkdir(parents=True)
     runtime = {'deviceId': 'synthetic-device', 'lastChangelogVersion': 'synthetic-version',
                'httpProxy': 'http://localhost:1234', 'compaction': {'enabled': False, 'keepRecentTokens': 20000}}
     old.write_text(json.dumps(runtime))
     settings = root / 'agent/settings.json'
     settings.parent.mkdir()
-    settings.symlink_to(old)
+    # Reproduce HM's old generation -> out-of-store link -> repository file.
+    generation = root / 'old-home-manager-files/.pi/agent/settings.json'
+    generation.parent.mkdir(parents=True)
+    generation.symlink_to(old)
+    settings.symlink_to(generation)
     def sync(expected=0):
         p = subprocess.run(['sh', str(script), str(defaults), str(settings)], capture_output=True)
         assert (p.returncode != 0 if expected else p.returncode == 0), p.stderr
-    sync()
+    # Execute the declared DAG order, including cleanOldGen's unlink behavior.
+    nix = (repo / 'home.nix').read_text()
+    declaration = re.search(r'syncPiSettings = lib.hm.dag.entry(After|Between)\s*\[([^]]*)\](?:\s*\[([^]]*)\])?', nix)
+    kind, first, second = declaration.groups()
+    before, after = ([], re.findall(r'"([^"]+)"', first)) if kind == 'After' else (
+        re.findall(r'"([^"]+)"', first), re.findall(r'"([^"]+)"', second))
+    graph = {'writeBoundary': [], 'linkGeneration': ['writeBoundary'], 'syncPiSettings': after}
+    for node in before:
+        graph.setdefault(node, []).append('syncPiSettings')
+    for node in TopologicalSorter(graph).static_order():
+        if node == 'syncPiSettings':
+            sync()
+        elif node == 'linkGeneration' and settings.is_symlink():
+            settings.unlink()  # removed from new generation
     assert not settings.is_symlink()
     actual = json.loads(settings.read_text())
     assert actual['deviceId'] == runtime['deviceId'] and actual['httpProxy'] == runtime['httpProxy']

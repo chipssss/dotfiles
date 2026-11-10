@@ -53,7 +53,8 @@ in
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.pi/agent/models.json";
   # Pi rewrites settings (device ID, changelog, proxy, preferences). Keep its
   # writable file local; activation reapplies only the repository-authored keys.
-  home.activation.syncPiSettings = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+  # Migrate before cleanOldGen (inside linkGeneration) unlinks the old file.
+  home.activation.syncPiSettings = lib.hm.dag.entryBetween [ "linkGeneration" ] [ "writeBoundary" ] ''
     PATH="${pkgs.jq}/bin:$PATH" /bin/sh ${./home/pi-settings-sync.sh} \
       ${./home/.pi/agent/settings.json} "$HOME/.pi/agent/settings.json"
   '';
