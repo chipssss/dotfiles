@@ -160,7 +160,7 @@ class Security(unittest.TestCase):
         d.cmd_clean(argparse.Namespace(name='DEMO', force=False))
         self.assertFalse(d.worker_dir('DEMO').exists())
 
-    def test_unmerged_work_requires_force(self):
+    def test_unpushed_work_survives_force(self):
         with patch.object(d, 'spawn_runner'): d.cmd_start(self.args())
         wt = d.WT_ROOT / 'DEMO'
         (wt / 'task').write_text('work')
@@ -168,7 +168,10 @@ class Security(unittest.TestCase):
         self.git(wt, 'commit', '-qm', 'worker change')
         with self.assertRaises(d.Refused): d.cmd_clean(argparse.Namespace(name='DEMO', force=False))
         self.assertTrue(d.worker_dir('DEMO').exists())
-        d.cmd_clean(argparse.Namespace(name='DEMO', force=True))
+        with self.assertRaises(d.Refused): d.cmd_clean(argparse.Namespace(name='DEMO', force=True))
+        self.assertTrue(wt.exists())
+        self.git(wt, 'push', '-qu', 'origin', 'HEAD')
+        d.cmd_clean(argparse.Namespace(name='DEMO', force=False))
         self.assertFalse(d.worker_dir('DEMO').exists())
 
     def test_base_normalization_and_protected_branch(self):

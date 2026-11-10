@@ -51,8 +51,12 @@ in
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.pi/agent/extensions";
   home.file.".pi/agent/models.json".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.pi/agent/models.json";
-  home.file.".pi/agent/settings.json".source =
-    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.pi/agent/settings.json";
+  # Pi rewrites settings (device ID, changelog, proxy, preferences). Keep its
+  # writable file local; activation reapplies only the repository-authored keys.
+  home.activation.syncPiSettings = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+    PATH="${pkgs.jq}/bin:$PATH" /bin/sh ${./home/pi-settings-sync.sh} \
+      ${./home/.pi/agent/settings.json} "$HOME/.pi/agent/settings.json"
+  '';
 
   # Pi worker dispatch (home/dispatch/README.md). The helpers stay in the repo next to these
   # entry points; only machine-wide safety policy belongs in the local config.

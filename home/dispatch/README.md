@@ -18,7 +18,9 @@ defaults (and an empty protected list still fails in strict mode).
 
 Home Manager links `dispatch` and `pi-worker`; helpers remain beside their real files.
 Before deploying a changed checkout, compare hand-installed copies with doctor.
-Deployment is separate from validation, and doctor never rebuilds or fetches.
+Deployment is separate from validation; doctor never rebuilds or changes installed links.
+Like status/wait, it reconciles exited workers (including fetching origin to verify
+that commits are published before deleting any local Git resources).
 
 Run from **any Git repository or worktree** with an `origin` remote, including a local
 bare remote. No GitHub account or `gh` dependency is needed.
@@ -30,7 +32,8 @@ dispatch status --json
 dispatch wait
 # Continue an existing remote branch; the hosting platform is irrelevant.
 dispatch start NEXT brief.md --branch feature/next --existing-branch --base origin/main
-# Clean only after checking the report. Remote branches are NEVER deleted.
+# Retry collection after resolving a reported safety block.
+# Remote branches and reports are NEVER deleted.
 dispatch clean DEMO
 ```
 
@@ -41,12 +44,45 @@ dispatch clean DEMO
   requires the remote branch to exist and no local same-named branch. Shared branch
   patterns cannot be used as worker branches. `--common FILE` prepends task context.
 - `--dry-run` does read-only preflight, with no state, worktree, pane or branch writes.
-- `status` shows running, needs-human, stuck, finished, failed and unexpected exits.
-- `wait [CURSOR]` waits for new supervisor events; restart it after each return.
-- `clean` stops a live supervisor only with `--force`, removes owned local resources,
-  archives state and frees ports. Dirty/unmerged work is retained unless forced.
-  Interrupted creation with uncertain ownership is never automatically deleted.
-- `_run` is an internal supervisor entry, not a project integration hook.
+- `status` reconciles exited workers, then shows remaining workers and any
+  `cleanup_blocked` reason (also in JSON).
+- `wait [CURSOR]` periodically reconciles while waiting for supervisor events;
+  restart it after each return. `CLEANED` / `CLEANUP BLOCKED` are events too.
+- `clean` retries the same safe collection. `--force` permits stopping a live
+  supervisor, **not** discarding files or unpublished commits.
+- `_run` and `_watch` are internal lifecycle entries, not project integration hooks.
+
+### Automatic collection
+
+Every start launches a detached collector in a separate process session. It survives
+SIGKILL of the runner or its process group. When the runner exits, it stops a surviving
+shell supervisor, closes the recorded pane in its original Rex session, and collects
+owned local resources without waiting for someone to read the report. Blocked collection
+retries every 30 seconds; only a changed reason emits another notification. The normal
+pi-worker completion path still closes its pane immediately after a scanned report and
+`.done`. Status, wait and doctor provide a second reconciliation path for older workers
+or an interrupted collector.
+
+```text
+runner exits (normally or SIGKILL)
+  -> stop surviving supervisor / close exact pane
+  -> verify ownership + clean worktree (including untracked/ignored files)
+  -> fetch origin --prune; every branch commit must be reachable on origin
+  -> verify no listeners remain in the reserved port block
+  -> remove worktree + local branch; release ports; archive state
+  unsafe/unknown -> retain Git resources + reservation; report why; retry
+```
+
+Remote branches, evidence and reports remain intact. Collection can happen before a
+hosted PR merges; it requires proof of publication, not a local main-branch merge or
+hosting-platform query. Archived state remains under `archive/NAME-TIMESTAMP` for private
+workflow adapters. Squash merges whose remote branch was deleted may leave no proof
+that the exact commits were pushed: those resources are deliberately retained. Missing
+origin, unknown pane session in legacy state, uncertain creation/ownership, dirty files
+and live port listeners also block deletion. Unknown listener processes are never killed.
+A collector does not survive a reboot, but status/wait/doctor can recover afterward.
+Kernel-backed locks release automatically after hard kills; an old mkdir lock requires
+explicit ownership inspection rather than guessed removal.
 
 Default state is `~/.local/state/dispatch/<hash-of-common-git-dir>`; worktrees of the
 same repository share state. Outputs live in `outputs/NAME/result.md` below it.
@@ -63,7 +99,8 @@ confirmation, idle pane or empty report. It notifies, writes `.needs-human` / `.
 and appends events, without including the captured command (which may contain secrets).
 A nonempty report and `.done` marker must pass the shared scanner before completion.
 Empty output gets at most three rewrite requests, then waits for human repair.
-Timeout preserves the pane. Model connection retries are bounded. `--attach` can
+Standalone timeout preserves the pane; dispatch's collector closes it after the runner
+exits, retaining unsafe Git resources as described above. Model connection retries are bounded. `--attach` can
 supervise an existing pane, but without a verifiable cwd, push confirmations wait.
 
 Automatic push approval reads **local Git configuration, never the network**:
@@ -121,7 +158,8 @@ can naturally differ between machines; compare status/version as well as hashes.
 Missing/different installation is a WARN before deployment, not proof that this new
 checkout is installed. FAIL means invalid safety policy or a missing runtime dependency.
 Matching shell comments are never accepted as evidence that a helper forwards to the
-repository. Doctor does not modify either installation.
+repository. Doctor does not modify either installation. Its `cleanup` checks report
+reconciled workers and blocked resources, without adding stdout outside the JSON document.
 
 The public release check under `tests/` examines only **this dotfiles checkout's**
 diff, commit messages and author/committer identities. It is not part of worker

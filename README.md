@@ -30,7 +30,7 @@ Running the switch builds:
 - Editor (Neovim config with the rose-pine moon theme)
 - Terminal (WezTerm config with the rose-pine moon theme and dimmed unfocused windows)
 - Agent configs (Claude, Codex, opencode all share one AGENTS.md)
-- Optional Pi theme and local extensions, generic UI settings and model overrides, plus two deliberately pinned third-party Pi packages
+- Optional Pi theme and local extensions, generic settings/default model/compaction overrides, plus four third-party Pi package declarations (two pinned)
 - Shared Agent environment: `pi-worker` supervision, conservative approvals, secret scanning and a lightweight Git worktree launcher (see [`home/dispatch/README.md`](home/dispatch/README.md)); no project workflow or hosting-platform dependency
 
 ## Prerequisites
@@ -163,7 +163,7 @@ npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 brew install --cask kunchenguid/tap/pi-launcher
 ```
 
-Home Manager owns exactly two repository-authored Pi directories: `~/.pi/agent/themes` and `~/.pi/agent/extensions`. It also links `models.json` and `settings.json` as individual files. The local extension directory is for public, repository-authored extensions only - third-party package code never belongs there. Run `/reload` after editing a local extension or other Pi resources. The terminal-title extension shows a spinner while Pi is working, then a completion mark with the session name or current directory. The `rose-pine-moon` theme was authored clean-room from the public [Rosé Pine Moon palette](https://rosepinetheme.com/palette) and Pi's [public theme schema](https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json), not from a private or live theme file.
+Home Manager owns exactly two repository-authored Pi directories: `~/.pi/agent/themes` and `~/.pi/agent/extensions`. It also links `models.json`. Pi's writable `~/.pi/agent/settings.json` is a **machine-local regular file**, not a repository symlink. Activation deep-merges the defaults from `home/.pi/agent/settings.json` into it: authored keys win, while runtime-only keys such as `deviceId`, `lastChangelogVersion` and `httpProxy` remain local. Existing symlinks are replaced without modifying their targets. Malformed settings abort the sync rather than losing local state. Pi can rewrite its file without dirtying this checkout; edit the repository defaults to share a preference across machines. The sync is implemented in `home/pi-settings-sync.sh` and can be tested without rebuilding. The local extension directory is for public, repository-authored extensions only - third-party package code never belongs there. Run `/reload` after editing a local extension or other Pi resources. The terminal-title extension shows a spinner while Pi is working, then a completion mark with the session name or current directory. The `rose-pine-moon` theme was authored clean-room from the public [Rosé Pine Moon palette](https://rosepinetheme.com/palette) and Pi's [public theme schema](https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json), not from a private or live theme file.
 
 ### Pi Calm
 
@@ -173,18 +173,24 @@ When enabled, Calm hides collapsed thinking and the call/result shells for Pi's 
 
 Calm never changes prompts, tool execution, model context, session data, or ordering. `/share` and `/export` use the complete stock transcript. Generic custom tools, images, and unsupported Pi transcript classes deliberately remain visible because Pi has no safe general-purpose transcript filter. If a future Pi release no longer exports the exact collapsed-thinking rendering seam, Calm logs one diagnostic and leaves only that adapter disabled; all other behavior remains available.
 
-Pi's package system declares two third-party sources in the linked global `settings.json`:
+Pi's authored settings declare four third-party sources:
 
 - `npm:pi-web-access@0.14.0` - the exact public npm release for web access.
 - `npm:@ryan_nookpi/pi-extension-codex-fast-mode@0.2.6` - the exact public npm release from `ryan_nookpi`.
+- `npm:pi-better-openai` - unpinned; follows package updates.
+- `npm:@casualjim/pi-pstack` - unpinned; follows package updates.
 
-The versions are immutable pins, so Pi does not move them during package updates. Deliberate updates require a new source and security audit, followed by an explicit pin change in `home/.pi/agent/settings.json`. On Pi 0.82.0, global settings declarations install missing pinned packages automatically at startup. No one-time install command is required. Pi keeps the downloaded npm package trees in its own unmanaged `~/.pi/agent/npm` runtime directory, outside Home Manager and Git tracking.
+The first two versions are immutable pins, so Pi does not move them during package updates. Deliberate updates require a new source and security audit, followed by an explicit pin change in `home/.pi/agent/settings.json`. On Pi 0.82.0, global settings declarations install missing pinned packages automatically at startup. No one-time install command is required. Pi keeps the downloaded npm package trees in its own unmanaged `~/.pi/agent/npm` runtime directory, outside Home Manager and Git tracking.
 
-Both packages execute with your full user permissions and must be trusted like any other executable code.
+All four packages execute with your full user permissions and must be trusted like any other executable code.
 
-Home Manager deliberately does not manage `~/.pi/agent` itself, or Pi authentication, sessions, trust decisions, caches, npm/git package trees, or any other runtime state. The model overrides contain no credentials or endpoint settings, do not choose a default model, and only take effect after you authenticate Pi yourself. This remains an additive post-video layer: it does not install Pi, a launcher, or package source code into this repository.
+Home Manager deliberately does not manage `~/.pi/agent` itself, or Pi authentication, sessions, trust decisions, caches, npm/git package trees, or any other runtime state. The authored settings choose a default model and per-model compaction reserves, but contain no credentials or machine endpoints; authenticate Pi yourself before use. This remains an additive post-video layer: it does not install Pi, a launcher, or package source code into this repository.
 
 ## Notes
+
+`home/.zshrc.additions` sources an optional, user-owned `~/.zshrc.machine` last.
+Put machine-specific environment exports (for example a local proxy) there, never in
+this checkout. Home Manager does not replace or publish that file.
 
 The shared credential scanner exempts a loopback password URL only when its
 password is in `secret_fixture_passwords` **and** the entire URL follows the
