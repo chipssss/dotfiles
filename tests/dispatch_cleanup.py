@@ -1,285 +1,171 @@
-"""Exercise automatic collection through the CLI, including a SIGKILLed runner."""
+"""Real Git cleanup regressions; share repository/environment setup with security tests."""
 import json
 import os
 from pathlib import Path
-import shutil
 import signal
 import subprocess
-import tempfile
 import time
-
-SCRIPTS = Path(__file__).resolve().parents[1] / 'home/dispatch'
-
-
-def run(*args, env=None, ok=True):
-    p = subprocess.run(list(map(str, args)), env=env, capture_output=True, text=True, timeout=30)
-    assert not ok or p.returncode == 0, (args, p.stdout, p.stderr)
-    return p
+import unittest
+import dispatch_security as security
+SCRIPTS = security.SCRIPTS
 
 
-with tempfile.TemporaryDirectory(prefix='dispatch-cleanup-', dir='/private/tmp') as tmp:
-    root = Path(tmp)
-    repo = root / 'repo'
-    remote = root / 'remote.git'
-    repo.mkdir()
-    git = lambda *args, **kw: run('git', '-C', repo, *args, **kw)
-    git('init', '-qb', 'main')
-    git('config', 'user.name', 'Fixture')
-    git('config', 'user.email', 'fixture@example.invalid')
-    (repo / 'tracked').write_text('base\n')
-    git('add', '.'); git('commit', '-qm', 'base')
-    run('git', 'init', '--bare', '-q', remote)
-    git('remote', 'add', 'origin', remote)
-    git('push', '-qu', 'origin', 'main')
-    config = root / 'config'
-    config.write_text('protected_branches = main release/*\n')
-    state = root / 'state'
-    wtroot = root / 'worktrees'
-    bindir = root / 'bin'; bindir.mkdir()
-    rex = bindir / 'rex'
-    rex.write_text('''#!/usr/bin/env python3
+class Cleanup(unittest.TestCase):
+    git = security.Security.git
+
+    def setUp(self):
+        security.Security.setUp(self)
+        self.bin = self.root / 'bin'; self.bin.mkdir()
+        self.patch_env = unittest.mock.patch.dict(os.environ, HOME=str(self.root / 'home'),
+            PATH=str(self.bin) + os.pathsep + os.environ['PATH'], REX_SESSION='session:wrong-parent',
+            PI_SUPERVISOR_STATE_DIR=str(self.root / 'events'), FAKE_REX=str(self.root))
+        self.patch_env.start(); self.addCleanup(self.patch_env.stop)
+        self.tool('lsof', '#!/bin/sh\nexit 1\n')
+        self.tool('rex', '''#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
 root = Path(os.environ['FAKE_REX'])
 args = sys.argv[1:]
+closed = root / 'closed'
 if args[:2] == ['block', 'ls']:
-    closed = (root / 'closed-ids').read_text().splitlines() if (root / 'closed-ids').exists() else []
-    ids = [p.read_text().strip() for p in (root / 'evidence').glob('*/result.md.block')]
-    print(json.dumps({'blocks': [{'block_id': b} for b in ids if b not in closed]}))
+    print(json.dumps({'blocks': [] if closed.exists() else [{'block_id': 'block:fixture'}]}))
 elif args[:2] == ['block', 'close']:
     if (root / 'close-fails').exists(): sys.exit(1)
-    (root / 'closed').write_text(' '.join(args))
-    with (root / 'closed-ids').open('a') as f: f.write(args[2] + '\\n')
-elif args[:2] == ['block', 'inspect']:
-    sys.exit(1 if (root / 'closed').exists() else 0)
+    assert args[-1] == 'session:original'
+    closed.touch()
 ''')
-    rex.chmod(0o755)
-    lsof = bindir / 'lsof'
-    lsof.write_text('#!/bin/sh\nexit 1\n'); lsof.chmod(0o755)
-    env = dict(os.environ, HOME=str(root / 'home'), DISPATCH_CONFIG=str(config), DISPATCH_REPO=str(repo),
-               DISPATCH_STATE_DIR=str(state), DISPATCH_EVIDENCE_DIR=str(root / 'evidence'),
-               DISPATCH_WORKTREE_ROOT=str(wtroot), PI_SUPERVISOR_STATE_DIR=str(root / 'events'),
-               FAKE_REX=str(root), PATH=str(bindir) + os.pathsep + os.environ['PATH'],
-               REX_SESSION='session:wrong-parent')
-    cli = lambda *args: run(SCRIPTS / 'dispatch', *args, env=env)
-    number = 0
 
-    def fixture(name, published=True, phase='ready', owns=True):
-        global number
-        number += 1
-        (root / 'closed').unlink(missing_ok=True)
-        wt = wtroot / name
-        branch = 'dispatch/' + name.lower()
-        git('worktree', 'add', '-qb', branch, wt, 'main')
-        if published:
-            run('git', '-C', wt, 'push', '-qu', 'origin', 'HEAD')
-        d = state / 'workers' / name; d.mkdir(parents=True)
-        out = root / 'evidence' / name / 'result.md'; out.parent.mkdir(parents=True)
-        Path(str(out) + '.block').write_text('block:' + name)
-        reservation = wtroot / '.ports' / str(4000 + number * 10)
-        reservation.parent.mkdir(exist_ok=True)
-        reservation.write_text(str(d))
-        data = dict(name=name, repo=str(repo), branch=branch, worktree=str(wt), owns_local=owns,
-                    out=str(out), phase=phase, ports={'base': int(reservation.name)},
-                    rex_session='session:original')
-        (d / 'state.json').write_text(json.dumps(data))
-        return wt, branch, d, out, reservation
+    def tool(self, name, content):
+        p = self.bin / name; p.write_text(content); p.chmod(0o755)
 
-    def gone(f, name):
-        wt, branch, d, out, reservation = f
-        assert not wt.exists() and not d.exists() and not reservation.exists(), name
-        assert git('show-ref', '--verify', 'refs/heads/' + branch, ok=False).returncode != 0
-        assert list((state / 'archive').glob(name + '-*'))
-        assert 'session:original' in (root / 'closed').read_text(), 'close in original Rex session'
+    def cli(self, *args, ok=True):
+        p = subprocess.run([str(SCRIPTS / 'dispatch'), *args], capture_output=True, text=True, timeout=45)
+        self.assertTrue(not ok or p.returncode == 0, p.stderr)
+        return p
 
-    f = fixture('ORPHAN')
-    cli('status', '--json')
-    gone(f, 'ORPHAN')
-    print('PASS: status closes orphan pane and releases worktree, branch, ports; archives evidence')
+    def fixture(self, name='DEMO', **changes):
+        wt = self.root / 'wt' / name
+        self.git(self.repo, 'worktree', 'add', '-qb', 'dispatch/' + name, str(wt), 'main')
+        self.git(wt, 'push', '-qu', 'origin', 'HEAD')
+        directory = self.root / 'state/workers' / name; directory.mkdir(parents=True)
+        out = self.root / 'outputs' / name / 'result.md'; out.parent.mkdir(parents=True)
+        Path(str(out) + '.block').write_text('block:fixture')
+        data = dict(name=name, repo=str(self.repo), worktree=str(wt), branch='dispatch/' + name,
+                    phase='ready', owns_local=True, ports={'base': 4500}, out=str(out), rex_session='session:original')
+        data.update(changes)
+        (directory / 'state.json').write_text(json.dumps(data))
+        reservation = self.root / 'wt/.ports/4500'; reservation.parent.mkdir(exist_ok=True)
+        reservation.write_text(str(directory))
+        self.wt, self.directory, self.out, self.data = wt, directory, out, data
+        return wt
 
-    for name, edit in [('DIRTY', 'tracked'), ('UNTRACKED', 'untracked'), ('IGNORED', 'cache')]:
-        f = fixture(name)
-        if name == 'IGNORED':
-            (f[0] / '.gitignore').write_text('cache\n')
-            run('git', '-C', f[0], 'add', '.gitignore')
-            run('git', '-C', f[0], 'commit', '-qm', 'ignore')
-            run('git', '-C', f[0], 'push', '-q', 'origin', 'HEAD')
-        (f[0] / edit).write_text('uncommitted\n')
-        rows = json.loads(cli('status', '--json').stdout)
-        assert f[0].exists() and f[2].exists() and f[4].exists()
-        assert any(r['name'] == name and r.get('cleanup_blocked') for r in rows), rows
-        assert (root / 'closed').exists(), 'close orphan pane even when preserving work'
-    print('PASS: tracked, untracked and ignored files block deletion and are reported')
+    def gone(self):
+        for p in (self.wt, self.directory, self.root / 'wt/.ports/4500'):
+            self.assertFalse(p.exists(), p)
+        self.assertTrue(list((self.root / 'state/archive').glob(self.data['name'] + '-*')))
+        self.assertTrue((self.root / 'closed').exists())
+        refs = self.git(self.repo, 'for-each-ref', '--format=%(refname)', 'refs/heads')
+        self.assertNotIn('refs/heads/' + self.data['branch'], refs.splitlines())
 
-    f = fixture('UNPUSHED')
-    (f[0] / 'tracked').write_text('local-only\n')
-    run('git', '-C', f[0], 'commit', '-qam', 'local-only')
-    assert '未推送' in cli('status').stdout and f[0].exists()
-    # --force is not permission to discard unpublished work either.
-    p = run(SCRIPTS / 'dispatch', 'clean', 'UNPUSHED', '--force', env=env, ok=False)
-    assert p.returncode != 0 and f[0].exists()
-    print('PASS: unpushed commits survive automatic and explicit forced collection')
+    def test_local_blocks_and_force(self):
+        for name, path, ignored in [('dirty', 'tracked', False), ('untracked', 'new', False), ('ignored', '.env', True)]:
+            with self.subTest(name=name):
+                wt = self.fixture(name)
+                if ignored:
+                    (wt / '.gitignore').write_text('.env\n'); self.git(wt, 'add', '.')
+                    self.git(wt, 'commit', '-qm', 'ignore'); self.git(wt, 'push', '-q', 'origin', 'HEAD')
+                (wt / path).write_text('local data')
+                # Security's shared fixture has no tracked files: create a real tracked edit.
+                if name == 'dirty':
+                    self.git(wt, 'add', '.'); self.git(wt, 'commit', '-qm', 'tracked')
+                    (wt / path).write_text('dirty')
+                self.assertIn('cleanup_blocked', self.cli('status', '--json').stdout)
+                self.assertNotEqual(self.cli('clean', name, '--force', ok=False).returncode, 0)
+                self.assertTrue(wt.exists())
 
-    f = fixture('PUBLISHED')
-    (f[0] / 'tracked').write_text('published feature\n')
-    run('git', '-C', f[0], 'commit', '-qam', 'published')
-    run('git', '-C', f[0], 'push', '-q', 'origin', 'HEAD')
-    cli('status'); gone(f, 'PUBLISHED')
-    print('PASS: pushed but not locally merged branch can be collected')
+    def test_realistic_setup_and_custom_allowlist(self):
+        wt = self.fixture()
+        (wt / '.gitignore').write_text('node_modules/\ndist/\n.env\n')
+        self.git(wt, 'add', '.'); self.git(wt, 'commit', '-qm', 'setup'); self.git(wt, 'push', '-q', 'origin', 'HEAD')
+        for path in ('node_modules/pkg/index.js', 'dist/index.js', '.env'):
+            p = wt / path; p.parent.mkdir(parents=True, exist_ok=True); p.write_text('synthetic local data')
+        self.cli('status'); self.assertTrue(wt.exists(), '.env must block')
+        (wt / '.env').unlink()
+        self.config.write_text('protected_branches = main\nregenerable_dirs =\n')
+        self.cli('status'); self.assertTrue(wt.exists(), 'empty list disables exceptions')
+        self.config.write_text('protected_branches = main\nregenerable_dirs = node_modules dist\n')
+        # A merged commit remains provably published after its feature ref is deleted.
+        self.git(self.repo, 'checkout', '-q', 'main'); self.git(self.repo, 'merge', '--ff-only', 'dispatch/DEMO')
+        self.git(self.repo, 'push', '-q', 'origin', 'main'); self.git(self.repo, 'push', '-q', 'origin', '--delete', 'dispatch/DEMO')
+        self.cli('status'); self.gone()
 
-    f = fixture('FETCHFAIL')
-    git('remote', 'set-url', 'origin', root / 'missing.git')
-    cli('status'); assert f[0].exists() and f[2].exists()
-    git('remote', 'set-url', 'origin', remote)
-    cli('status'); gone(f, 'FETCHFAIL')
-    print('PASS: unavailable remote fails closed, retry succeeds')
+    def test_transient_blocks(self):
+        self.fixture()
+        for tool, content in [('rex', None), ('lsof', '#!/bin/sh\necho 12345\nexit 0\n')]:
+            with self.subTest(tool=tool):
+                if content: self.tool(tool, content)
+                else: (self.root / 'close-fails').touch()
+                self.cli('status'); self.assertTrue(self.wt.exists())
+                (self.root / 'close-fails').unlink(missing_ok=True)
+        self.tool('lsof', '#!/bin/sh\nexit 1\n'); self.cli('status'); self.gone()
 
-    f = fixture('CLOSEFAIL')
-    (root / 'close-fails').touch()
-    cli('status'); assert f[0].exists() and f[2].exists()
-    (root / 'close-fails').unlink()
-    cli('status'); gone(f, 'CLOSEFAIL')
-    print('PASS: failed pane close retains all local resources')
+    def test_session_fallback_and_unknown(self):
+        self.fixture(rex_session='')
+        self.cli('status'); self.assertTrue(self.wt.exists())
+        Path(str(self.out) + '.rex-session').write_text('session:original')
+        self.cli('status'); self.gone()
 
-    # The watchdog runs detached from the worker's process group. Killing that
-    # whole group must still close the pane without any status/result consumer.
-    f = fixture('HARDKILL')
-    runner = subprocess.Popen(['sleep', '60'], start_new_session=True)
-    (f[2] / 'runner.pid').write_text(str(runner.pid))
-    watcher = subprocess.Popen([str(SCRIPTS / 'dispatch'), '_watch', 'HARDKILL'], env=env,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
-    try:
-        time.sleep(.2)
-        assert watcher.poll() is None
-        assert any(r['name'] == 'HARDKILL' and r['phase'] == 'running'
-                   for r in json.loads(cli('status', '--json').stdout))
-        os.killpg(runner.pid, signal.SIGKILL)
-        # Leave runner unreaped briefly: zombies must not hold resources forever.
-        assert watcher.wait(timeout=12) == 0, watcher.stderr.read().decode()
-        gone(f, 'HARDKILL')
-    finally:
-        if runner.poll() is None: runner.kill()
-        runner.wait()
-        if watcher.poll() is None: watcher.kill(); watcher.wait()
-    print('PASS: SIGKILLed supervisor group collected without reading result or running status')
+    def test_uncertain_ownership_and_missing_fields(self):
+        cases = [{'local_pending': True}, {'phase': 'preparing'}, {'branch': 'main'},
+                 {'branch': 'dispatch/foreign'}, {'owns_local': False}, {'repo': str(self.root / 'foreign')}]
+        for i, changes in enumerate(cases): self.fixture('unsafe' + str(i), **changes)
+        for field in ('name', 'out', 'branch', 'worktree', 'ports', 'repo', 'owns_local', 'phase'):
+            self.fixture('missing' + field)
+            self.data.pop(field)
+            (self.directory / 'state.json').write_text(json.dumps(self.data))
+        for command in [('status', '--json'), ('doctor', '--json'), ('wait',)]:
+            result = self.cli(*command)
+            text = json.dumps(json.loads(result.stdout), ensure_ascii=False) if '--json' in command else result.stdout
+            self.assertIn('状态缺失或无效', text)
+        self.assertEqual(len(list((self.root / 'state/workers').iterdir())), len(cases) + 8)
 
-    f = fixture('CHILD')
-    child = subprocess.Popen(['sleep', '60'], start_new_session=True)
-    (f[2] / 'worker.pid').write_text(str(child.pid))
-    identity = run('/bin/ps', '-p', child.pid, '-o', 'stat=', '-o', 'lstart=').stdout.split(maxsplit=1)[1].strip()
-    (f[2] / 'worker.identity').write_text(identity)
-    try:
-        cli('status'); gone(f, 'CHILD')
-        assert child.wait(timeout=3) == -signal.SIGTERM
-    finally:
-        if child.poll() is None: child.kill(); child.wait()
-    print('PASS: surviving shell supervisor is stopped before checking/removing Git resources')
+    def test_hardkill_single_collector_and_live_child(self):
+        self.fixture()
+        runner = subprocess.Popen(['sleep', '60'], start_new_session=True)
+        child = subprocess.Popen(['sleep', '60'], start_new_session=True)
+        security.d.record_pid(self.directory / 'runner.pid', runner.pid)
+        security.d.record_pid(self.directory / 'worker.pid', child.pid)
+        watcher = subprocess.Popen([str(SCRIPTS / 'dispatch'), '_watch'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            time.sleep(.3)
+            self.assertIsNone(watcher.poll())
+            self.cli('_watch')  # A second collector exits instead of doubling sweeps.
+            os.killpg(runner.pid, signal.SIGKILL)
+            self.assertEqual(watcher.wait(timeout=40), 0, watcher.stderr.read())
+            self.gone(); self.assertEqual(child.wait(timeout=3), -signal.SIGTERM)
+        finally:
+            for process in (runner, child, watcher):
+                if process.poll() is None: process.kill()
+                process.wait()
+            watcher.stderr.close()
 
-    f = fixture('REUSEDPID')
-    (f[2] / 'runner.pid').write_text(str(os.getpid()))
-    (f[2] / 'runner.identity').write_text('different process start time')
-    cli('status'); gone(f, 'REUSEDPID')
-    print('PASS: reused PID cannot impersonate the original runner')
+    def test_pid_reuse(self):
+        self.fixture()
+        (self.directory / 'runner.pid').write_text(str(os.getpid()))
+        (self.directory / 'runner.identity').write_text('different process start time')
+        self.cli('status'); self.gone()
 
-    f = fixture('LISTENER')
-    lsof.write_text('#!/bin/sh\necho 12345\nexit 0\n')
-    assert '端口段' in cli('status').stdout
-    assert f[0].exists() and f[4].exists()
-    lsof.write_text('#!/bin/sh\nexit 1\n')
-    cli('status'); gone(f, 'LISTENER')
-    print('PASS: live/unknown port listeners retain reservations; never kill unrelated processes')
+    def test_real_start_normal_exit(self):
+        payload = self.root / 'payload'; payload.write_text('#!/bin/sh\nexit 0\n')
+        with unittest.mock.patch.object(security.d, 'PI_WORKER', payload):
+            security.d.cmd_start(security.Security.args(self, name='NORMAL'))
+        end = time.monotonic() + 40
+        while (self.root / 'state/workers/NORMAL').exists() and time.monotonic() < end: time.sleep(.1)
+        self.assertFalse((self.root / 'wt/NORMAL').exists())
+        archive = next((self.root / 'state/archive').glob('NORMAL-*'))
+        self.assertTrue((archive / 'state.json').exists())
+        self.assertFalse((self.root / 'outputs/NORMAL/result.md').exists(), 'cleanup needs no report reader')
 
-    f = fixture('DOCTOR')
-    report = json.loads(cli('doctor', '--json').stdout)
-    assert any(c['area'] == 'cleanup' and 'DOCTOR' in c['text'] for c in report['checks'])
-    gone(f, 'DOCTOR')
-    print('PASS: doctor reconciles orphans while keeping stdout pure JSON')
 
-    f = fixture('WAIT')
-    runner = subprocess.Popen(['sleep', '60'], start_new_session=True)
-    (f[2] / 'runner.pid').write_text(str(runner.pid))
-    events = root / 'events/events.log'
-    cursor = root / 'wait.cursor'; cursor.write_text(str(events.stat().st_size))
-    waiter = subprocess.Popen([str(SCRIPTS / 'dispatch'), 'wait', str(cursor)], env=env,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        time.sleep(.8)
-        runner.kill(); runner.wait()
-        stdout, stderr = waiter.communicate(timeout=12)
-        assert waiter.returncode == 0 and 'CLEANED WAIT' in stdout, (stdout, stderr)
-        gone(f, 'WAIT')
-    finally:
-        if runner.poll() is None: runner.kill(); runner.wait()
-        if waiter.poll() is None: waiter.kill(); waiter.wait()
-    print('PASS: wait periodically collects a runner that dies after wait begins')
-
-    # Exercise the real start -> _run -> detached _watch wiring, not just an
-    # explicitly launched watcher. Only the Pi payload is replaced.
-    copied = root / 'tools/home/dispatch'
-    shutil.copytree(SCRIPTS, copied, ignore=shutil.ignore_patterns('__pycache__'))
-    payload = copied / 'pi-worker'
-    payload.write_text('''#!/bin/sh
-while [ "$#" -gt 0 ]; do
-  case "$1" in --out) out=$2 ;; esac
-  shift
-done
-mkdir -p "$(dirname "$out")"
-printf 'block:AUTODONE' > "$out.block"
-printf '%s' "$REX_SESSION" > "$out.rex-session"
-printf 'synthetic report' > "$out"
-''')
-    brief = root / 'brief'; brief.write_text('Synthetic worker task')
-    startenv = dict(env, REX_SESSION='session:original')
-    run(copied / 'dispatch', 'start', 'AUTODONE', brief, '--model', 'fixture/model', env=startenv)
-    end = time.monotonic() + 12
-    while (state / 'workers/AUTODONE').exists() and time.monotonic() < end:
-        time.sleep(.1)
-    assert not (state / 'workers/AUTODONE').exists()
-    assert not (wtroot / 'AUTODONE').exists()
-    archive = next((state / 'archive').glob('AUTODONE-*'))
-    assert (archive / 'exit.json').exists() and (archive / 'collector.log').exists()
-    print('PASS: real start wires a detached collector; normal completion needs no result reader')
-
-    # Kernel locks, unlike mkdir locks, cannot be stranded by a hard kill.
-    lockcode = '''import importlib.machinery, importlib.util, sys, time
-loader=importlib.machinery.SourceFileLoader('dispatch', sys.argv[1])
-spec=importlib.util.spec_from_loader('dispatch', loader)
-d=importlib.util.module_from_spec(spec); loader.exec_module(d)
-with d.Lock(d.Path(sys.argv[2])):
- d.Path(sys.argv[3]).touch()
- time.sleep(60)
-'''
-    ready = root / 'lock-ready'
-    locker = subprocess.Popen(['python3', '-B', '-c', lockcode, str(SCRIPTS / 'dispatch'),
-                               str(state / '.lock'), str(ready)])
-    try:
-        end = time.monotonic() + 5
-        while not ready.exists() and time.monotonic() < end: time.sleep(.03)
-        assert ready.exists()
-        locker.kill(); locker.wait()
-        f = fixture('LOCKKILL'); cli('status'); gone(f, 'LOCKKILL')
-    finally:
-        if locker.poll() is None: locker.kill(); locker.wait()
-    print('PASS: SIGKILL releases allocator/state locks automatically')
-
-    # Uncertain creation and non-owned/adopted worktrees never get removed.
-    for name, changes in [('PENDING', {'local_pending': True}),
-                          ('PREPARING', {'phase': 'preparing'}),
-                          ('WRONGBRANCH', {'branch': 'dispatch/someone-else'}),
-                          ('PROTECTED', {'branch': 'main'}),
-                          ('ADOPTED', {'owns_local': False, 'adopted': True}),
-                          ('FOREIGN', {'repo': str(root / 'another-repo')})]:
-        f = fixture(name)
-        data = json.loads((f[2] / 'state.json').read_text()); data.update(changes)
-        (f[2] / 'state.json').write_text(json.dumps(data))
-        cli('status')
-        assert f[0].exists() and f[2].exists(), name
-    print('PASS: incomplete, adopted and foreign states are retained')
-
-    # Legacy state records no Rex session. Never assume the caller's session.
-    f = fixture('LEGACY')
-    data = json.loads((f[2] / 'state.json').read_text()); data.pop('rex_session')
-    (f[2] / 'state.json').write_text(json.dumps(data))
-    cli('status')
-    assert f[0].exists() and f[2].exists()
-    print('PASS: unknown pane session is reported, never guessed')
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

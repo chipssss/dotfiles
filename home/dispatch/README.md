@@ -16,11 +16,9 @@ all setting defaults and built-in protected branches; launcher, approval, scanne
 and doctor use the same effective settings. Explicit empty values do not restore
 defaults (and an empty protected list still fails in strict mode).
 
-Home Manager links `dispatch` and `pi-worker`; helpers remain beside their real files.
-Before deploying a changed checkout, compare hand-installed copies with doctor.
-Deployment is separate from validation; doctor never rebuilds or changes installed links.
-Like status/wait, it reconciles exited workers (including fetching origin to verify
-that commits are published before deleting any local Git resources).
+Home Manager links `dispatch` and `pi-worker`; helpers stay beside their real files.
+Doctor compares old copies without rebuilding or deploying; like status/wait, it
+uses the shared cleanup path for exited workers.
 
 Run from **any Git repository or worktree** with an `origin` remote, including a local
 bare remote. No GitHub account or `gh` dependency is needed.
@@ -46,43 +44,45 @@ dispatch clean DEMO
 - `--dry-run` does read-only preflight, with no state, worktree, pane or branch writes.
 - `status` reconciles exited workers, then shows remaining workers and any
   `cleanup_blocked` reason (also in JSON).
-- `wait [CURSOR]` periodically reconciles while waiting for supervisor events;
+- `wait [CURSOR]` reconciles every 30 seconds while waiting for supervisor events;
   restart it after each return. `CLEANED` / `CLEANUP BLOCKED` are events too.
 - `clean` retries the same safe collection. `--force` permits stopping a live
   supervisor, **not** discarding files or unpublished commits.
-- `_run` and `_watch` are internal lifecycle entries, not project integration hooks.
+- `_watch` is an internal lifecycle entry, not a project integration hook.
 
 ### Automatic collection
 
-Every start launches a detached collector in a separate process session. It survives
-SIGKILL of the runner or its process group. When the runner exits, it stops a surviving
-shell supervisor, closes the recorded pane in its original Rex session, and collects
-owned local resources without waiting for someone to read the report. Blocked collection
-retries every 30 seconds; only a changed reason emits another notification. The normal
-pi-worker completion path still closes its pane immediately after a scanned report and
-`.done`. Status, wait and doctor provide a second reconciliation path for older workers
-or an interrupted collector.
+The launcher tracks the shell supervisor directly (no Python runner wrapper).
+One detached collector per repository sweeps every 30 seconds, surviving SIGKILL
+of a runner or its process group. All callers use the same collection function:
 
 ```text
-runner exits (normally or SIGKILL)
-  -> stop surviving supervisor / close exact pane
-  -> verify ownership + clean worktree (including untracked/ignored files)
-  -> fetch origin --prune; every branch commit must be reachable on origin
-  -> verify no listeners remain in the reserved port block
-  -> remove worktree + local branch; release ports; archive state
-  unsafe/unknown -> retain Git resources + reservation; report why; retry
+runner exits (normal / SIGKILL)
+  -> stop its surviving shell supervisor; close the exact pane in its original session
+  -> verify ownership, files, published commits and absence of port listeners
+  -> remove local worktree/branch; release ports; archive state
+  unsafe/unknown -> retain resources; report reason changes; retry
 ```
 
-Remote branches, evidence and reports remain intact. Collection can happen before a
-hosted PR merges; it requires proof of publication, not a local main-branch merge or
-hosting-platform query. Archived state remains under `archive/NAME-TIMESTAMP` for private
-workflow adapters. Squash merges whose remote branch was deleted may leave no proof
-that the exact commits were pushed: those resources are deliberately retained. Missing
-origin, unknown pane session in legacy state, uncertain creation/ownership, dirty files
-and live port listeners also block deletion. Unknown listener processes are never killed.
-A collector does not survive a reboot, but status/wait/doctor can recover afterward.
-Kernel-backed locks release automatically after hard kills; an old mkdir lock requires
-explicit ownership inspection rather than guessed removal.
+**A live shell supervisor whose runner was SIGKILLed is stopped**, not left running.
+PID start-time checks prevent stopping reused PIDs; kernel locks release on hard kills.
+The collector needs no report reader. Status/wait/doctor recover older or rebooted
+states through the same path. Pi-worker still closes its pane immediately on completion.
+
+`regenerable_dirs` is a space-separated list of worktree-relative directory roots
+(default `node_modules dist .turbo coverage .cache`; empty disables exceptions).
+Only **ignored contents** under these real, non-symlink directories may be discarded.
+Tracked edits, untracked files and all other ignored files (especially `.env`) block.
+For nested packages, list explicit roots such as `packages/web/node_modules` locally.
+
+Origin fetch/prune runs outside state/allocator locks with a 15-second timeout;
+both successes and failures are cached for 60 seconds across sweeps. `clean` explicitly
+retries immediately. Every commit must be reachable from those recently checked origin
+refs; local main or upstream alone is insufficient. Merged PRs need no special path.
+Remote branches/reports stay intact; state moves to `archive/NAME-TIMESTAMP`. A squash
+merge with a deleted remote branch may be unprovable and is retained. Incomplete state,
+unknown pane sessions/ownership and live listeners also block; unknown processes are
+never killed. Old directory locks require manual ownership inspection.
 
 Default state is `~/.local/state/dispatch/<hash-of-common-git-dir>`; worktrees of the
 same repository share state. Outputs live in `outputs/NAME/result.md` below it.
