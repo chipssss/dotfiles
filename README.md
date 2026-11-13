@@ -32,6 +32,7 @@ Running the switch builds:
 - Agent configs (Claude, Codex, opencode all share one AGENTS.md)
 - Optional Pi theme and local extensions, generic UI settings and model overrides, plus two deliberately pinned third-party Pi packages
 - Shared Agent environment: `pi-worker` supervision, conservative approvals, secret scanning and a lightweight Git worktree launcher (see [`home/dispatch/README.md`](home/dispatch/README.md)); no project workflow or hosting-platform dependency
+- Claude Code `lin-mode` skill and a hook that blocks Claude subagents, so delegation goes through pi workers or `cc` in Rex panes (see [Claude lin-mode](#claude-lin-mode))
 
 ## Prerequisites
 
@@ -183,6 +184,19 @@ The versions are immutable pins, so Pi does not move them during package updates
 Both packages execute with your full user permissions and must be trusted like any other executable code.
 
 Home Manager deliberately does not manage `~/.pi/agent` itself, or Pi authentication, sessions, trust decisions, caches, npm/git package trees, or any other runtime state. The model overrides contain no credentials or endpoint settings, do not choose a default model, and only take effect after you authenticate Pi yourself. This remains an additive post-video layer: it does not install Pi, a launcher, or package source code into this repository.
+
+## Claude lin-mode
+
+`/lin-mode` (`home/.claude/skills/lin-mode`) is a personal working style for Claude Code: the main session only dispatches, picks models by `quota-axi`, and delegates to `pi-worker`, `dispatch`, or `cc` in Rex panes that it keeps watching. `home/.claude/hooks/block-claude-subagent.sh` denies the Agent tool and points at those entry points; `ALLOW_CLAUDE_SUBAGENT=1` at launch turns it off.
+
+Home Manager links both, but `~/.claude/settings.json` stays machine-local, so register the hook once per machine:
+
+```sh
+jq '.hooks.PreToolUse = ((.hooks.PreToolUse // []) + [{"matcher":"^(Agent|Task|mcp__cchost__Agent)$","hooks":[{"type":"command","command":"~/.claude/hooks/block-claude-subagent.sh","timeout":5}]}])' \
+  ~/.claude/settings.json > /tmp/claude-settings.json && mv /tmp/claude-settings.json ~/.claude/settings.json
+```
+
+Each machine also writes its own `~/.claude/rules/lin-mode-local.md` (task tracker, backlog, per-project dispatch entry) and keeps model routing in `~/.claude/rules/pstack-models.md`. Neither belongs in this repository.
 
 ## Notes
 
