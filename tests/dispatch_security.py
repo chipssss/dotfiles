@@ -1,6 +1,7 @@
 """Generic launcher/security integration tests. No hosting platform or network."""
 import argparse
 import contextlib
+import fcntl
 import importlib.machinery
 import importlib.util
 import io
@@ -160,7 +161,7 @@ class Security(unittest.TestCase):
         d.cmd_clean(argparse.Namespace(name='DEMO', force=False))
         self.assertFalse(d.worker_dir('DEMO').exists())
 
-    def test_unmerged_work_requires_force(self):
+    def test_unpushed_work_survives_force(self):
         with patch.object(d, 'spawn_runner'): d.cmd_start(self.args())
         wt = d.WT_ROOT / 'DEMO'
         (wt / 'task').write_text('work')
@@ -168,8 +169,49 @@ class Security(unittest.TestCase):
         self.git(wt, 'commit', '-qm', 'worker change')
         with self.assertRaises(d.Refused): d.cmd_clean(argparse.Namespace(name='DEMO', force=False))
         self.assertTrue(d.worker_dir('DEMO').exists())
-        d.cmd_clean(argparse.Namespace(name='DEMO', force=True))
+        with self.assertRaises(d.Refused): d.cmd_clean(argparse.Namespace(name='DEMO', force=True))
+        self.assertTrue(wt.exists())
+        self.git(wt, 'push', '-qu', 'origin', 'HEAD')
+        d.cmd_clean(argparse.Namespace(name='DEMO', force=False))
         self.assertFalse(d.worker_dir('DEMO').exists())
+
+    def test_cleanup_fetch_budget_and_timeout(self):
+        with patch.object(d, 'spawn_runner'): d.cmd_start(self.args())
+        # A dirty preflight must not become deletable without a remote check.
+        with patch.object(d, 'check_files', side_effect=[d.Refused('dirty preflight'), None]):
+            with self.assertRaises(d.Refused): d.collect('DEMO')
+        wt = d.WT_ROOT / 'DEMO'
+        (wt / 'task').write_text('local work'); self.git(wt, 'add', '.')
+        self.git(wt, 'commit', '-qm', 'unpublished')
+        original, fetches = d.run, []
+        def probe(cmd, **kw):
+            if 'fetch' in cmd:
+                self.assertEqual(kw.get('timeout'), 15)
+                for path in (d.ROOT / '.lock', d.WT_ROOT / '.allocator-lock'):
+                    with path.open('a') as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fetches.append(cmd)
+            return original(cmd, **kw)
+        with patch.object(d, 'run', side_effect=probe):
+            d.reconcile(); d.reconcile()
+            self.assertEqual(len(fetches), 1, 'blocked sweeps must reuse the remote check')
+        self.assertTrue(wt.exists())
+        cache = d.ROOT / 'origin-check.json'; cache.unlink()
+        with patch.object(d.subprocess, 'run', side_effect=subprocess.TimeoutExpired('git', 15)) as fetch:
+            with self.assertRaises(d.Refused): d.refresh_origin()
+            self.assertEqual(fetch.call_args.kwargs['timeout'], 15)
+        with patch.object(d.subprocess, 'run') as fetch:
+            with self.assertRaises(d.Refused): d.refresh_origin()
+            fetch.assert_not_called()  # Failures are throttled too.
+        self.assertTrue(wt.exists())
+
+    def test_wait_sweep_interval(self):
+        waiter = unittest.mock.Mock(returncode=0)
+        waiter.poll.side_effect = [None, 0, 0]
+        with patch.object(d.subprocess, 'Popen', return_value=waiter), patch.object(d, 'reconcile') as sweep:
+            self.assertEqual(d.cmd_wait(argparse.Namespace(cursor=None)), 0)
+        sweep.assert_called_once()
+        waiter.wait.assert_called_once_with(timeout=30)
 
     def test_base_normalization_and_protected_branch(self):
         self.assertEqual(d.normalize_base('origin/main'), 'main')

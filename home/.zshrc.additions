@@ -10,8 +10,8 @@ if [[ -d "$_dotfiles_nix_profile/share/zsh/site-functions" ]]; then
 fi
 autoload -U compinit && compinit
 
-if [[ -r "$_dotfiles_nix_profile/share/zsh-autosuggestions/zsh-autosuggestions.zsh" ]]; then
-  source "$_dotfiles_nix_profile/share/zsh-autosuggestions/zsh-autosuggestions.zsh"
+if [[ -r "$_dotfiles_nix_profile/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh" ]]; then
+  source "$_dotfiles_nix_profile/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh"
   ZSH_AUTOSUGGEST_STRATEGY=(history)
 fi
 
@@ -78,3 +78,8 @@ export FZF_COMPLETION_TRIGGER="${FZF_COMPLETION_TRIGGER:-\\}"
 export FZF_TMUX_HEIGHT="${FZF_TMUX_HEIGHT:-80%}"
 
 unset _dotfiles_nix_profile
+
+# Machine-local environment (proxies, endpoints, etc.) stays outside this repo.
+if [[ -r "$HOME/.zshrc.machine" ]]; then
+  source "$HOME/.zshrc.machine"
+fi

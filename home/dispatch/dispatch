@@ -14,6 +14,7 @@ Only machine-wide safety settings belong in DISPATCH_CONFIG.
 import argparse
 import datetime
 import fnmatch
+import fcntl
 import hashlib
 import json
 import os
@@ -34,14 +35,19 @@ DOTFILES = SCRIPTS.parent.parent
 PI_WORKER = SCRIPTS / 'pi-worker'
 PI_TRUST = Path.home() / '.pi/agent/trust.json'
 CONF = REPO = ROOT = EVIDENCE = WT_ROOT = PORTS = None
+SWEEP_SECONDS = 30
+FETCH_SECONDS = 60
 
 
 class Refused(Exception):
     pass
 
 
-def run(cmd, cwd=None, check=True):
-    p = subprocess.run(list(map(str, cmd)), cwd=cwd, capture_output=True, text=True)
+def run(cmd, cwd=None, check=True, timeout=None):
+    try:
+        p = subprocess.run(list(map(str, cmd)), cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Refused(f'{Path(str(cmd[0])).name} 超时，保留资源') from None
     if check and p.returncode:
         # Never copy external stderr into notifications: it can contain credentials.
         raise Refused(f'{Path(str(cmd[0])).name} 失败，exit {p.returncode}')
@@ -73,16 +79,20 @@ class Lock:
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.is_dir():
+            raise Refused('旧版目录锁仍存在，先核对持有进程')
+        self.stream = self.path.open('a')
         for _ in range(200):
             try:
-                self.path.mkdir()
+                fcntl.flock(self.stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return self
-            except FileExistsError:
+            except BlockingIOError:
                 time.sleep(.05)
+        self.stream.close()
         raise Refused('状态锁被占用超过 10 秒，请先核对持有进程')
 
     def __exit__(self, *exc):
-        self.path.rmdir()
+        self.stream.close()  # Kernel also releases flock after SIGKILL. Never unlink it.
 
 
 def worker_dir(name):
@@ -95,29 +105,59 @@ def save(state):
     d = worker_dir(state['name'])
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / 'state.json.tmp'
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n')
+    tmp.write_text(json.dumps({k: v for k, v in state.items() if k != '_invalid'}, ensure_ascii=False, indent=2) + '\n')
     tmp.replace(d / 'state.json')
 
 
 def load(name):
-    return json.loads((worker_dir(name) / 'state.json').read_text())
+    state = json.loads((worker_dir(name) / 'state.json').read_text())
+    valid = all(isinstance(state.get(k), str) and state[k] for k in ('name', 'repo', 'out', 'branch', 'worktree', 'phase'))
+    ports = state.get('ports')
+    valid = valid and isinstance(state.get('owns_local'), bool) and state.get('name') == name
+    valid = valid and isinstance(ports, dict) and type(ports.get('base')) is int and 1024 <= ports['base'] <= 65526
+    state['_invalid'] = None if valid else '状态缺失或无效，先修复记录，保留资源'
+    state['name'] = name  # Directory identity is authoritative, even for incomplete records.
+    try:
+        state['cleanup_blocked'] = (worker_dir(name) / 'cleanup-blocked').read_text()
+    except FileNotFoundError:
+        pass
+    return state
 
 
 def workers():
-    return [json.loads(p.read_text()) for p in sorted((ROOT / 'workers').glob('*/state.json'))]
+    states = []
+    for p in sorted((ROOT / 'workers').glob('*/state.json')):
+        try:
+            states.append(load(p.parent.name))
+        except FileNotFoundError:  # A collector may have archived it.
+            pass
+    return states
+
+
+def process_identity(pid):
+    # No command line (or credentials) is read. Zombies count as exited.
+    p = run(['/bin/ps', '-p', pid, '-o', 'stat=', '-o', 'lstart='], check=False)
+    fields = p.stdout.split(maxsplit=1)
+    return fields[1].strip() if len(fields) == 2 and not fields[0].startswith('Z') else None
 
 
 def alive(path):
     try:
         pid = int(path.read_text())
+        if pid <= 1:
+            return None
         os.kill(pid, 0)
-        return pid
+        identity = process_identity(pid)
+        stamp = path.with_suffix('.identity')
+        if identity and (not stamp.exists() or stamp.read_text() == identity):
+            return pid
     except (OSError, ValueError):
-        return None
+        pass
+    return None
 
 
 def allocate_ports():
-    used = {s['ports']['base'] for s in workers() if s.get('ports')}
+    used = {s['ports']['base'] for s in workers() if isinstance(s.get('ports'), dict) and 'base' in s['ports']}
     # The process lock is global across repositories, and other states reserve their
     # blocks until clean. The live listener check also covers non-dispatch processes.
     registry = WT_ROOT / '.ports'
@@ -171,12 +211,32 @@ def compose_brief(state, task, common):
 
 
 def spawn_runner(name):
-    with (worker_dir(name) / 'supervisor.log').open('a') as log:
-        p = subprocess.Popen([sys.executable, '-I', str(SCRIPTS / 'dispatch'), '_run', name],
-                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
-                             env=dict(os.environ, DISPATCH_REPO=str(REPO), DISPATCH_STATE_DIR=str(ROOT),
-                                      DISPATCH_EVIDENCE_DIR=str(EVIDENCE), DISPATCH_WORKTREE_ROOT=str(WT_ROOT)))
-    (worker_dir(name) / 'runner.pid').write_text(str(p.pid))
+    d = worker_dir(name)
+    state = load(name)
+    (d / 'runner.launching').touch()
+    context = Path(state['worktree']) / 'AGENTS.md'
+    worker = ['sh', str(PI_WORKER), '--model', state['model'], '--thinking', state['thinking'],
+              '--cwd', state['worktree'], *(['--context', str(context)] if context.is_file() else []),
+              '--prompt-file', str(d / 'brief.md'),
+              '--out', state['out'], '--label', 'dispatch ' + name,
+              '--timeout-min', str(state['timeout_min']), '--idle-min', '12']
+    for cmd, logfile in [(worker, d / 'supervisor.log'),
+                         ([sys.executable, '-I', str(SCRIPTS / 'dispatch'), '_watch'], ROOT / 'collector.log')]:
+        with logfile.open('a') as log:
+            p = subprocess.Popen(cmd,
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                                 env=dict(os.environ, DISPATCH_REPO=str(REPO), DISPATCH_STATE_DIR=str(ROOT),
+                                          DISPATCH_EVIDENCE_DIR=str(EVIDENCE), DISPATCH_WORKTREE_ROOT=str(WT_ROOT)))
+        if logfile == d / 'supervisor.log':
+            record_pid(d / 'runner.pid', p.pid)
+            (d / 'runner.launching').unlink()
+
+
+def record_pid(path, pid):
+    path.write_text(str(pid))
+    identity = process_identity(pid)
+    if identity:
+        path.with_suffix('.identity').write_text(identity)
 
 
 def trust_worktree_root():
@@ -224,7 +284,7 @@ def cmd_start(a):
         state = dict(name=a.name, branch=branch, base=base, worktree=str(wt), ports=ports,
                      out=str(EVIDENCE / a.name / 'result.md'), model=a.model, thinking=a.thinking,
                      timeout_min=a.timeout, started_at=now(), phase='preparing', owns_local=False,
-                     resumed=a.existing_branch, repo=str(REPO))
+                     resumed=a.existing_branch, repo=str(REPO), rex_session=os.environ.get('REX_SESSION', ''))
         save(state)
         reservation = WT_ROOT / '.ports' / str(ports['base'])
         reservation.parent.mkdir(parents=True, exist_ok=True)
@@ -259,78 +319,235 @@ def cmd_start(a):
     print(f'started {a.name}: {wt}, {branch}, ports {ports["base"]}-{ports["last"]}\nreport {state["out"]}')
 
 
-def context_args(directory):
-    f = Path(directory) / 'AGENTS.md'
-    return ['--context', str(f)] if f.is_file() else []
-
-
-def cmd_run(a):
-    state = load(a.name)
-    d = worker_dir(a.name)
-    (d / 'runner.pid').write_text(str(os.getpid()))
-    code = subprocess.call(['sh', str(PI_WORKER), '--model', state['model'], '--thinking', state['thinking'],
-                            '--cwd', state['worktree'], *context_args(state['worktree']), '--prompt-file', str(d / 'brief.md'),
-                            '--out', state['out'], '--label', 'dispatch ' + a.name,
-                            '--timeout-min', str(state['timeout_min']), '--idle-min', '12'])
-    targets = [p for p in [Path(state['out']).parent, d / 'supervisor.log'] if p.exists()]
-    scan = run([SCRIPTS / 'secret-scan.sh', *targets], check=False) if targets else None
-    (d / 'exit.json').write_text(json.dumps({'code': code, 'scan': scan.returncode if scan else 2, 'at': now()}))
-
-
 def cmd_status(a):
+    reconcile()
     rows = []
     for state in workers():
         d = worker_dir(state['name'])
-        out = Path(state['out'])
+        out = Path(state['out']) if isinstance(state.get('out'), str) and state['out'] else d / 'unknown-output'
         phase = state.get('phase', 'unknown')
         if alive(d / 'runner.pid'):
             phase = 'needs-human' if Path(str(out) + '.needs-human').exists() else 'stuck' if Path(str(out) + '.stuck').exists() else 'running'
-        elif (d / 'exit.json').exists():
+        elif (d / 'exit.json').exists() or Path(str(out) + '.done').exists():
             phase = 'finished'
         elif phase == 'ready':
             phase = 'exited'
-        rows.append(dict(name=state['name'], phase=phase, branch=state.get('branch'), ports=state.get('ports'), out=state['out']))
+        rows.append(dict(name=state['name'], phase='blocked' if state['_invalid'] else phase,
+                         branch=state.get('branch'), ports=state.get('ports'), out=state.get('out'),
+                         cleanup_blocked=state['_invalid'] or state.get('cleanup_blocked')))
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
     else:
         for row in rows:
-            print(f'{row["name"]}: {row["phase"]}, {row["branch"]}, ports {row["ports"]}, {row["out"]}')
+            print(f'{row["name"]}: {row["phase"]}, {row["branch"]}, ports {row["ports"]}, {row["out"]}'
+                  + (f'; cleanup blocked: {row["cleanup_blocked"]}' if row['cleanup_blocked'] else ''))
         if not rows:
             print('没有在跑的 worker')
 
 
-def cmd_clean(a):
-    with Lock(WT_ROOT / '.allocator-lock'), Lock(ROOT / '.lock'):
-        state = load(a.name)
-        d = worker_dir(a.name)
-        if state.get('local_pending'):
-            raise Refused('创建被中断，先用 git worktree list 和 git show-ref 核对资源归属，不删除未知资源')
-        pid = alive(d / 'runner.pid')
-        if pid and not a.force:
-            raise Refused('监管仍在运行，确认放弃才可 --force')
-        if pid:
-            os.killpg(pid, signal.SIGTERM)
-            for _ in range(100):
-                if not alive(d / 'runner.pid'):
-                    break
-                time.sleep(.05)
-            else:
-                raise Refused('监管尚未退出，保留资源后重试')
-        # Read old states too, but never delete a remote branch.
-        wt = Path(state['worktree']) if state.get('worktree') else None
-        if wt and state.get('owns_local', not state.get('adopted')):
+def event(text):
+    directory = Path(os.environ.get('PI_SUPERVISOR_STATE_DIR', '/private/tmp/pi-supervisor'))
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'events.log').open('a') as stream:
+        stream.write(f'{now()} {text}\n')
+
+
+def close_pane(state):
+    out = Path(state['out'])
+    marker = Path(str(out) + '.pane-closed')
+    block_file = Path(str(out) + '.block')
+    if marker.exists() or not block_file.exists():
+        return
+    block = block_file.read_text().strip()
+    if not re.fullmatch(r'block:[A-Za-z0-9-]+', block):
+        raise Refused('pane ID 无效，保留资源')
+    session_file = Path(str(out) + '.rex-session')
+    session = state.get('rex_session')
+    if not session and session_file.exists():
+        session = session_file.read_text().strip()
+    if not session:
+        raise Refused('pane 所属 Rex session 未记录，先核对旧状态，不猜测当前 session')
+    env = dict(os.environ)
+    env.pop('REX_SESSION', None)
+    def rex(*args):
+        return subprocess.run(['rex', 'block', *args, '-s', session], env=env, capture_output=True, text=True)
+    def present():
+        p = rex('ls', '--json')
+        if p.returncode:
+            raise Refused('无法列出 Rex panes，保留资源')
+        data = json.loads(p.stdout)
+        if not isinstance(data.get('blocks'), list):
+            raise Refused('Rex pane 列表无效，保留资源')
+        return any(b.get('block_id') == block for b in data['blocks'])
+    if present():
+        if rex('close', block).returncode or present():
+            raise Refused('pane 尚未关闭，保留资源')
+    marker.touch()
+
+
+def check_files(wt):
+    allowed = [p for p in dispatchconf.words(CONF, 'regenerable_dirs')
+               if (wt / p).is_dir() and not (wt / p).is_symlink()]
+    for entry in run(['git', '-C', wt, 'status', '--porcelain', '-z', '--untracked-files=all', '--ignored']).stdout.split('\0'):
+        if entry and not (entry.startswith('!! ') and any(entry[3:].startswith(p + '/') for p in allowed)):
+            raise Refused('worktree 有未提交、未跟踪或非可再生成的忽略文件，保留资源')
+
+
+def refresh_origin():
+    # Cache both success and failure across CLI invocations. Never hold state or
+    # allocator locks during network I/O. Concurrent fetches are harmless.
+    cache = ROOT / 'origin-check.json'
+    try:
+        checked, error = json.loads(cache.read_text())
+    except (OSError, ValueError):
+        checked, error = 0, None
+    if not 0 <= time.time() - checked < FETCH_SECONDS:
+        error = None
+        try:
+            run(['git', '-C', REPO, 'fetch', '--quiet', '--prune', 'origin', '+refs/heads/*:refs/remotes/origin/*'], timeout=15)
+        except Refused as exc:
+            error = str(exc)
+        tmp = cache.with_suffix(f'.{os.getpid()}.tmp')
+        tmp.write_text(json.dumps([time.time(), error])); tmp.replace(cache)
+    if error:
+        raise Refused(error)
+
+
+def stop_group(path):
+    pid = alive(path)
+    if not pid:
+        return
+    if not path.with_suffix('.identity').exists() or os.getpgid(pid) != pid:
+        raise Refused('无法确认监管身份或独立进程组，保留资源')
+    os.killpg(pid, signal.SIGTERM)
+    for _ in range(100):
+        if not alive(path):
+            return
+        time.sleep(.05)
+    raise Refused('监管尚未退出，保留资源后重试')
+
+
+def collect(name, force=False):
+    refreshed = False
+    while True:
+        with Lock(WT_ROOT / '.allocator-lock'), Lock(ROOT / '.lock'):
+            d = worker_dir(name)
+            if not d.exists():
+                return
+            state = load(name)
+            if state['_invalid']:
+                raise Refused(state['_invalid'])
+            if state.get('local_pending') or state.get('remote_pending') or state['phase'] == 'preparing':
+                raise Refused('创建被中断，先核对资源归属，不删除未知资源')
+            if Path(state['repo']).resolve() != REPO:
+                raise Refused('状态属于其他仓库，不删除')
+            if state.get('adopted'):
+                raise Refused('未拥有本地资源，不自动删除')
+            if alive(d / 'runner.pid') and not force:
+                raise Refused('监管仍在运行，确认放弃才可 --force')
+            stop_group(d / 'runner.pid')
+            if (d / 'worker.launching').exists() or (d / 'runner.launching').exists():
+                raise Refused('supervisor 创建结果不确定，先核对遗留进程，保留资源')
+            stop_group(d / 'worker.pid')  # Legacy shell supervisor can outlive its runner.
+            close_pane(state)
+            branch = state['branch']
+            validate_branch(branch)
+            if protected_branch(branch):
+                raise Refused('受保护分支不删除')
+            wt = Path(state['worktree'])
+            exists = not run(['git', '-C', REPO, 'show-ref', '--verify', '--quiet', 'refs/heads/' + branch], check=False).returncode
+            if not state['owns_local'] and (wt.exists() or exists):
+                raise Refused('未拥有本地资源，不自动删除')
             if wt.exists():
-                run(['git', '-C', REPO, 'worktree', 'remove', *(['--force'] if a.force else []), wt])
-            if not run(['git', '-C', REPO, 'show-ref', '--verify', '--quiet', 'refs/heads/' + state['branch']], check=False).returncode:
-                run(['git', '-C', REPO, 'branch', '-D' if a.force else '-d', state['branch']])
-        if state.get('ports'):
-            reservation = WT_ROOT / '.ports' / str(state['ports']['base'])
-            if reservation.exists() and reservation.read_text() == str(d):
-                reservation.unlink()
-        archive = ROOT / 'archive' / f'{a.name}-{time.time_ns()}'
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        d.rename(archive)
-        print(f'cleaned {a.name}; remote branches retained; archive {archive}')
+                records = run(['git', '-C', REPO, 'worktree', 'list', '--porcelain']).stdout.split('\n\n')
+                if not any(f'worktree {wt.resolve()}\n' in record + '\n' and
+                           f'branch refs/heads/{branch}\n' in record + '\n' for record in records):
+                    raise Refused('worktree 路径或分支归属不匹配')
+                check_files(wt)
+            if refreshed or not exists:
+                if exists and run(['git', '-C', REPO, 'rev-list', branch, '--not', '--remotes=origin']).stdout:
+                    raise Refused('分支含未推送或无法证明已发布的提交，保留资源')
+                ports = state['ports']
+                listeners = run(['lsof', '-nP', f'-iTCP:{ports["base"]}-{ports.get("last", ports["base"] + 9)}',
+                                 '-sTCP:LISTEN', '-t'], check=False)
+                if listeners.returncode != 1 or listeners.stdout.strip():
+                    raise Refused('端口段仍有监听进程或无法核对，不杀未知进程，保留资源')
+                if wt.exists():
+                    run(['git', '-C', REPO, 'worktree', 'remove', wt])
+                if exists:
+                    run(['git', '-C', REPO, 'branch', '-D', branch])
+                reservation = WT_ROOT / '.ports' / str(ports['base'])
+                if reservation.exists() and reservation.read_text() == str(d):
+                    reservation.unlink()
+                archive = ROOT / 'archive' / f'{name}-{time.time_ns()}'
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                d.rename(archive)
+                event(f'CLEANED {name}: 本地资源已回收，远端分支保留')
+                return archive
+        # Only locally safe workers need a remote check. Release both locks, then
+        # re-read state and repeat every local check before permitting deletion.
+        refresh_origin()
+        refreshed = True
+
+
+def reconcile(names=None):
+    results = []
+    for name in names if names is not None else [s['name'] for s in workers()]:
+        d = worker_dir(name)
+        if not d.exists() or alive(d / 'runner.pid'):
+            continue
+        try:
+            collect(name)
+            results.append(('OK', f'{name}: 已回收'))
+        except (Refused, OSError, ValueError) as exc:
+            reason = str(exc) if isinstance(exc, Refused) else '无法安全核对资源，保留状态'
+            try:
+                marker = d / 'cleanup-blocked'
+                if not marker.exists() or marker.read_text() != reason:
+                    marker.write_text(reason)
+                    event(f'CLEANUP BLOCKED {name}: {reason}')
+            except FileNotFoundError:
+                pass  # Another collector archived it; no state rewrite or lock needed.
+            results.append(('WARN', f'{name}: {reason}'))
+    return results
+
+
+def cmd_watch(a):
+    # One collector per repository, not one immortal process per blocked worker.
+    with (ROOT / '.collector-lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        while True:
+            reconcile()
+            with Lock(ROOT / '.lock'):
+                if not workers():
+                    fcntl.flock(lock, fcntl.LOCK_UN)  # Release before a concurrent start can launch.
+                    return
+            time.sleep(SWEEP_SECONDS)
+
+
+def cmd_wait(a):
+    waiter = subprocess.Popen(['sh', str(SCRIPTS / 'pi-events-wait.sh'), *([a.cursor] if a.cursor else [])])
+    try:
+        while waiter.poll() is None:
+            reconcile()
+            try:
+                waiter.wait(timeout=SWEEP_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+        return waiter.returncode
+    finally:
+        if waiter.poll() is None:
+            waiter.terminate()
+            waiter.wait()
+
+
+def cmd_clean(a):
+    (ROOT / 'origin-check.json').unlink(missing_ok=True)  # Explicit retry bypasses the cache.
+    archive = collect(a.name, a.force)
+    print(f'cleaned {a.name}; remote branches retained; archive {archive}')
 
 
 class Doctor:
@@ -376,7 +593,7 @@ def cmd_doctor(a):
         dispatchconf.approval_policy(conf)
         # Hash effective policy, not its path, comments or presentation whitespace.
         effective = dict(conf)
-        for key in ('temp_dirs', 'secret_fixture_passwords'):
+        for key in ('temp_dirs', 'secret_fixture_passwords', 'regenerable_dirs'):
             effective[key] = sorted(set(dispatchconf.words(effective, key)))
         effective['protected_branches'] = sorted(set(dispatchconf.protected_branches(conf)))
         config_sha256 = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()
@@ -418,6 +635,13 @@ def cmd_doctor(a):
         install[source.name] = dict(path=str(installed), kind=kind, status=status)
     for directory in a.compare:
         compare_dir(doc, directory)
+    if config_sha256:
+        try:
+            configure()
+            for level, text in reconcile():
+                doc.say(level, 'cleanup', text)
+        except (Refused, OSError, ValueError):
+            doc.say('WARN', 'cleanup', '无法选择运行仓库，跳过回收')
     if a.json:
         print(json.dumps(dict(head=head, files=fingerprints, dependencies=deps, versions=versions,
                               config_sha256=config_sha256, dirty=dirty, install=install,
@@ -451,17 +675,14 @@ def main():
     s = sub.add_parser('doctor')
     s.add_argument('--compare', action='append', default=[])
     s.add_argument('--json', action='store_true')
-    s = sub.add_parser('_run')
-    s.add_argument('name')
+    sub.add_parser('_watch')
     a = ap.parse_args()
     try:
-        if a.cmd == 'wait':
-            os.execv('/bin/sh', ['sh', str(SCRIPTS / 'pi-events-wait.sh'), *([a.cursor] if a.cursor else [])])
         if a.cmd == 'doctor':
             return cmd_doctor(a)
         configure()
-        {'start': cmd_start, 'status': cmd_status, 'clean': cmd_clean, '_run': cmd_run}[a.cmd](a)
-        return 0
+        return {'start': cmd_start, 'status': cmd_status, 'wait': cmd_wait, 'clean': cmd_clean,
+                '_watch': cmd_watch}[a.cmd](a) or 0
     except (Refused, ValueError, OSError) as e:
         print(f'dispatch: {e}', file=sys.stderr)
         return 1

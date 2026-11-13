@@ -9,7 +9,8 @@ from pathlib import Path
 
 # The single source for omitted settings, shared by every policy consumer.
 DEFAULTS = dict(ports='3110-3999', approval_mode='strict', protected_branches='',
-                temp_dirs='/tmp/ /private/tmp/ .tmp/', secret_fixture_passwords='postgres synthetic')
+                temp_dirs='/tmp/ /private/tmp/ .tmp/', secret_fixture_passwords='postgres synthetic',
+                regenerable_dirs='node_modules dist .turbo coverage .cache')
 KEYS = set(DEFAULTS)
 DEFAULT = Path.home() / '.config/dispatch/config'
 
@@ -54,6 +55,9 @@ def validate(conf):
     for root in words(conf, 'temp_dirs'):
         if root != '.tmp/' and (not root.startswith(('/tmp/', '/private/tmp/')) or '..' in Path(root).parts):
             raise ValueError('temp_dirs 仅支持临时根的子目录或 .tmp/')
+    for directory in words(conf, 'regenerable_dirs'):
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', directory) or any(p in ('.', '..', '.git') for p in directory.split('/')):
+            raise ValueError('regenerable_dirs 必须是相对目录路径，不能含 .、.. 或 .git')
     ports = conf['ports']
     if not re.fullmatch(r'[0-9]+-[0-9]+', ports):
         raise ValueError('ports 应写成 起-止')

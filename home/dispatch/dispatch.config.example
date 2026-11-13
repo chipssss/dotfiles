@@ -15,6 +15,10 @@ temp_dirs = /tmp/ /private/tmp/ .tmp/
 # One ten-port block per worker, reserved across repositories until clean.
 ports = 3110-3999
 
+# Only ignored contents under these relative directories may be discarded.
+# Empty disables exceptions. Other ignored files (e.g. .env) always block cleanup.
+regenerable_dirs = node_modules dist .turbo coverage .cache
+
 # Optional extra Python regex patterns. Scanner output never contains matched values.
 # secret_pattern.example-token = \bexample_[A-Za-z0-9]{20,}
 # Password whitelist (default below). A loopback exemption first requires:

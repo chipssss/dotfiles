@@ -59,7 +59,7 @@ notify() {
 if [ -n "$attach" ]; then
   block=$attach
 else
-  rm -f "$out" "$out.done" "$out.needs-human" "$out.stuck"
+  rm -f "$out" "$out.done" "$out.needs-human" "$out.stuck" "$out.pane-closed"
   tools=read,bash,edit,write,grep,find,ls
   rule="When you are finished, write your complete final answer to $out with the write tool, then check with ls -la that $out is non-empty (a very long answer can be truncated to an empty write; if so, write it again in parts with bash appends), then write the single word done to $out.done."
   if [ "$readonly" = 1 ]; then
@@ -90,8 +90,14 @@ $rule"
   [ -n "$block" ] || { echo "pi-worker: rex run did not return a pane" >&2; exit 1; }
 fi
 printf '%s\n' "$block" > "$out.block"
-# shellcheck disable=SC2086
-trap 'rex block close $scope "$block" >/dev/null 2>&1; exit 143' TERM INT HUP
+printf '%s\n' "${REX_SESSION:-}" > "$out.rex-session"
+close_pane() {
+  # shellcheck disable=SC2086
+  if rex block close $scope "$block" >/dev/null 2>&1; then
+    : > "$out.pane-closed"
+  fi
+}
+trap 'close_pane; exit 143' TERM INT HUP
 deadline=$(( $(date +%s) + timeout * 60 ))
 last_screen='' last_change=$(date +%s) needs='' stuck='' nudged=0 resumes=0
 set_stuck() {
@@ -176,6 +182,5 @@ while :; do
 done
 rm -f "$out.needs-human" "$out.stuck"
 notify "DONE $name"
-# shellcheck disable=SC2086
-[ -n "$block" ] && rex block close $scope "$block" >/dev/null 2>&1 || true
+close_pane
 echo "$out"
