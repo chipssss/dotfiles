@@ -61,6 +61,13 @@ in
   home.file.".claude/bin/pi-worker".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/dispatch/pi-worker";
 
+  # lin-mode: delegate through pi / cc in Rex panes; the hook blocks Claude subagents.
+  # Register the hook in the machine-local ~/.claude/settings.json (see README).
+  home.file.".claude/skills/lin-mode".source =
+    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.claude/skills/lin-mode";
+  home.file.".claude/hooks/block-claude-subagent.sh".source =
+    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/.claude/hooks/block-claude-subagent.sh";
+
   home.file.".claude/CLAUDE.md".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/home/AGENTS.md";
   home.file.".codex/AGENTS.md".source =
